@@ -128,12 +128,15 @@ def import_file(db_path):
     print(f"Imported {count} records.")
 
 
-def show_stats(db_path):
-    stats = fetch_one(
+def get_stats(db_path):
+    return fetch_one(
         db_path,
         "SELECT COUNT(*) AS total_cves, ROUND(AVG(cvss_score), 2) AS average_cvss FROM cves",
     ) or {}
-    top_vendors = fetch_all(
+
+
+def get_top_vendors(db_path):
+    return fetch_all(
         db_path,
         """
         SELECT vendors.name AS vendor, COUNT(DISTINCT cve_products.cve_id) AS vuln_count
@@ -145,6 +148,27 @@ def show_stats(db_path):
         LIMIT 10
         """,
     )
+
+
+def find_cves(db_path, keyword="", minimum_value=None, limit=20):
+    like_keyword = f"%{keyword.lower()}%"
+    return fetch_all(
+        db_path,
+        """
+        SELECT cves.cve_id, cves.severity, cves.cvss_score, cves.published, cves.description
+        FROM cves
+        WHERE (? = '' OR LOWER(cves.cve_id) LIKE ? OR LOWER(cves.description) LIKE ?)
+          AND (? IS NULL OR cves.cvss_score >= ?)
+        ORDER BY cves.cvss_score DESC, cves.published DESC
+        LIMIT ?
+        """,
+        (keyword.lower(), like_keyword, like_keyword, minimum_value, minimum_value, limit),
+    )
+
+
+def show_stats(db_path):
+    stats = get_stats(db_path)
+    top_vendors = get_top_vendors(db_path)
 
     print()
     print(f"Total CVEs: {stats.get('total_cves', 0)}")
@@ -161,19 +185,7 @@ def filter_cves(db_path):
         print("Invalid CVSS score.")
         return
 
-    like_keyword = f"%{keyword}%"
-    rows = fetch_all(
-        db_path,
-        """
-        SELECT cves.cve_id, cves.severity, cves.cvss_score, cves.published, cves.description
-        FROM cves
-        WHERE (? = '' OR LOWER(cves.cve_id) LIKE ? OR LOWER(cves.description) LIKE ?)
-          AND (? IS NULL OR cves.cvss_score >= ?)
-        ORDER BY cves.cvss_score DESC, cves.published DESC
-        LIMIT 20
-        """,
-        (keyword, like_keyword, like_keyword, minimum_value, minimum_value),
-    )
+    rows = find_cves(db_path, keyword=keyword, minimum_value=minimum_value, limit=20)
     print()
     print_rows(rows, limit=20)
 

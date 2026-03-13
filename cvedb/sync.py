@@ -68,7 +68,7 @@ def run(db_path):
         print("Days must be a whole number.")
         return
 
-    api_key = os.getenv("NVD_API_KEY") or input("NVD API key [optional]: ").strip()
+    api_key = os.getenv("NIST_API_KEY", "")
     try:
         sync_recent(db_path, api_key=api_key, days=days)
     except Exception as error:

@@ -10,15 +10,45 @@ CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 ALLOWED_TABLES = {"cves", "vendors", "products", "cve_products"}
 
 
-def clarify(question):
+def get_clarification(question):
     lower = question.lower()
     if ("bad" in lower or "serious" in lower) and not re.search(r"\b\d+(\.\d+)?\b", lower):
-        threshold = input("What CVSS score should count as bad? [9.0]: ").strip() or "9.0"
-        return f"{question}. Treat bad as CVSS >= {threshold}."
+        return "What CVSS score should count as bad?", "9.0"
     if ("recent" in lower or "latest" in lower or "new" in lower) and not re.search(r"\b(last|today|yesterday|\d{4}-\d{2}-\d{2})\b", lower):
-        window = input("What date range should count as recent? [last 30 days]: ").strip() or "last 30 days"
-        return f"{question}. Treat recent as {window}."
-    return question
+        return "What date range should count as recent?", "last 30 days"
+    return None
+
+
+def apply_clarification(question, answer):
+    return f"{question}. Additional detail: {answer}."
+
+
+def clarify(question):
+    clarification = get_clarification(question)
+    if clarification is None:
+        return question
+
+    prompt, default = clarification
+    answer = input(f"{prompt} [{default}]: ").strip() or default
+    return apply_clarification(question, answer)
+
+
+def model_name():
+    return os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+
+def api_key():
+    return os.getenv("CEREBRAS_API_KEY", "")
+
+
+def run_query(db_path, question):
+    sql = validate_sql(extract_sql(generate_sql(clarify(question), api_key(), model_name())))
+    return sql, fetch_all(db_path, sql)
+
+
+def run_query_with_text(db_path, question):
+    sql = validate_sql(extract_sql(generate_sql(question, api_key(), model_name())))
+    return sql, fetch_all(db_path, sql)
 
 
 def extract_sql(text):
@@ -79,14 +109,12 @@ def run(db_path):
         print("Question is required.")
         return
 
-    api_key = os.getenv("CEREBRAS_API_KEY") or input("Cerebras API key: ").strip()
-    if not api_key:
+    if not api_key():
         print("API key is required.")
         return
 
     try:
-        sql = validate_sql(extract_sql(generate_sql(clarify(question), api_key, os.getenv("CEREBRAS_MODEL", "llama-4-scout-17b-16e-instruct"))))
-        rows = fetch_all(db_path, sql)
+        sql, rows = run_query(db_path, question)
     except Exception as error:
         print(f"AI query failed: {error}")
         return
