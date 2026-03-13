@@ -282,8 +282,34 @@ def reset_metrics():
     AI_METRICS["events"] = []
 
 
+def sanitize_json_schema(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key in {"additionalProperties", "default", "title"}:
+                continue
+            cleaned[key] = sanitize_json_schema(item)
+        return cleaned
+    if isinstance(value, list):
+        return [sanitize_json_schema(item) for item in value]
+    return value
+
+
+def extract_json(text):
+    text = str(text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return text
+    return text[start : end + 1].strip()
+
+
 def parse_plan(text):
-    plan = Plan.model_validate_json(text)
+    plan = Plan.model_validate_json(extract_json(text))
     if plan.action == "ask_clarification":
         return {"action": "ask_clarification", "clarification_question": plan.clarification_question.strip()}
     return {"action": "run_sql", "sql": plan.sql.strip()}
@@ -308,7 +334,7 @@ def validate_sql(sql):
     for table in re.findall(r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)", cleaned, re.IGNORECASE):
         if table.lower() not in ALLOWED_TABLES:
             raise ValueError(f"Table not allowed: {table}")
-    if " limit " not in cleaned.lower():
+    if not re.search(r"\blimit\b", cleaned, re.IGNORECASE):
         cleaned = f"{cleaned} LIMIT 20"
     return cleaned
 
@@ -417,13 +443,19 @@ def generate_plan_gemini(question, retry_message="", status_callback=None):
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
-                max_output_tokens=220,
+                max_output_tokens=320,
                 response_mime_type="application/json",
-                response_json_schema=PLAN_SCHEMA,
+                response_json_schema=sanitize_json_schema(PLAN_SCHEMA),
             ),
         )
         usage = _gemini_usage(response)
-        text = _content_text(_read_value(response, "text"))
+        parsed = _read_value(response, "parsed")
+        if isinstance(parsed, Plan):
+            text = parsed.model_dump_json()
+        elif isinstance(parsed, dict):
+            text = json.dumps(parsed)
+        else:
+            text = _content_text(_read_value(response, "text"))
         if not text:
             record_request("gemini", model, usage, status="error", note="no text")
             raise RuntimeError("Gemini returned no structured text.")
@@ -445,7 +477,14 @@ def generate_plan(question, retry_message="", status_callback=None, provider=Non
     if selected_provider == "cerebras":
         if not api_key():
             raise RuntimeError("CEREBRAS_API_KEY is not set.")
-        return generate_plan_cerebras(question, retry_message, status_callback=status_callback)
+        try:
+            return generate_plan_cerebras(question, retry_message, status_callback=status_callback)
+        except Exception as error:
+            if _error_status(error) == 429 and gemini_api_key():
+                notify_status(status_callback, "Cerebras is busy right now. Falling back to Google...")
+                log_stdout("fallback provider=cerebras->gemini reason=429")
+                return generate_plan_gemini(question, retry_message, status_callback=status_callback)
+            raise
     if selected_provider == "gemini":
         if not gemini_api_key():
             raise RuntimeError("GEMINI_API_KEY is not set.")
