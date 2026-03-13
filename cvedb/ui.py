@@ -1,13 +1,19 @@
 import os
 import tempfile
 
-import pandas as pd
 import streamlit as st
 
 from cvedb.db import fetch_all, fetch_one, init_db, save_records
 from cvedb.imports import find_cves, get_stats, get_top_vendors, load_records
 from cvedb.query import api_key, apply_clarification, get_clarification, run_query_with_text
 from cvedb.sync import sync_recent
+
+
+def chart_rows(rows, label_key, value_key):
+    return {
+        str(row.get(label_key, "")): row.get(value_key, 0)
+        for row in rows
+    }
 
 
 def render_search(db_path):
@@ -128,32 +134,30 @@ def render_analytics(db_path):
         fetch_one(db_path, "SELECT COUNT(*) AS count FROM cves WHERE cvss_score >= 9.0")["count"],
     )
 
-    top_vendors = pd.DataFrame(get_top_vendors(db_path))
-    severity_rows = pd.DataFrame(
-        fetch_all(
-            db_path,
-            """
-            SELECT COALESCE(NULLIF(TRIM(severity), ''), 'UNKNOWN') AS severity, COUNT(*) AS total
-            FROM cves
-            GROUP BY COALESCE(NULLIF(TRIM(severity), ''), 'UNKNOWN')
-            ORDER BY total DESC
-            """,
-        )
+    top_vendors = get_top_vendors(db_path)
+    severity_rows = fetch_all(
+        db_path,
+        """
+        SELECT COALESCE(NULLIF(TRIM(severity), ''), 'UNKNOWN') AS severity, COUNT(*) AS total
+        FROM cves
+        GROUP BY COALESCE(NULLIF(TRIM(severity), ''), 'UNKNOWN')
+        ORDER BY total DESC
+        """,
     )
 
     left, right = st.columns(2)
     with left:
         st.caption("Top vendors by CVE count")
-        if not top_vendors.empty:
-            st.bar_chart(top_vendors.set_index("vendor"))
+        if top_vendors:
+            st.bar_chart(chart_rows(top_vendors, "vendor", "vuln_count"))
             st.dataframe(top_vendors, use_container_width=True)
         else:
             st.info("No vendor data yet.")
 
     with right:
         st.caption("Severity distribution")
-        if not severity_rows.empty:
-            st.bar_chart(severity_rows.set_index("severity"))
+        if severity_rows:
+            st.bar_chart(chart_rows(severity_rows, "severity", "total"))
             st.dataframe(severity_rows, use_container_width=True)
         else:
             st.info("No severity data yet.")

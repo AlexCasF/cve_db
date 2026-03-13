@@ -52,4 +52,5 @@ streamlit run cvedb/ui.py
 ## Notes
 
 - The AI query menu is optional at runtime if you do not have an AI API key.
+- The Streamlit UI no longer depends on `pandas`; charts are built from plain Python data.
 - Use DB Browser for SQLite to inspect `cve.db` directly.
