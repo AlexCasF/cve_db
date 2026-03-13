@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from db import fetch_all, fetch_one, init_db, save_records
 from imports import find_cves, get_stats, get_top_vendors, load_records
-from query import api_key, apply_clarification, gemini_api_key, resolve_query
+from query import api_key, apply_clarification, gemini_api_key, get_metrics, reset_metrics, resolve_query
 from sync import sync_recent
 
 
@@ -188,6 +188,26 @@ def render_analytics(db_path):
 def render_chat(db_path):
     st.subheader("NL to SQL chat")
     st.caption("Chat idea: keep SQL visible, let the user refine filters, and show the result table below each reply.")
+
+    metrics = get_metrics()
+    a, b, c, d = st.columns(4)
+    a.metric("AI requests", metrics["requests"])
+    b.metric("Prompt tokens", metrics["prompt_tokens"])
+    c.metric("Completion tokens", metrics["completion_tokens"])
+    d.metric("Total tokens", metrics["total_tokens"])
+
+    with st.expander("AI metering", expanded=False):
+        st.markdown(
+            f"- Cerebras requests: {metrics['by_provider'].get('cerebras', 0)}\n"
+            f"- Gemini requests: {metrics['by_provider'].get('gemini', 0)}"
+        )
+        if st.button("Reset AI metrics"):
+            reset_metrics()
+            st.rerun()
+        if metrics["events"]:
+            render_rows(metrics["events"], title="Recent AI events", limit=20)
+        else:
+            st.info("No AI requests yet.")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []

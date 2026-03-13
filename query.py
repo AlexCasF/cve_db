@@ -2,7 +2,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 
 import requests
 from dotenv import load_dotenv
@@ -13,6 +13,74 @@ from db import fetch_all, print_rows
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 ALLOWED_TABLES = {"cves", "vendors", "products", "cve_products"}
+MAX_EVENTS = 20
+AI_METRICS = {
+    "requests": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "by_provider": {"cerebras": 0, "gemini": 0},
+    "events": [],
+}
+
+
+def log_stdout(message):
+    print(f"[AI] {message}")
+
+
+def record_request(provider, model, usage=None, status="ok", note=""):
+    usage = usage or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+
+    AI_METRICS["requests"] += 1
+    AI_METRICS["by_provider"][provider] = AI_METRICS["by_provider"].get(provider, 0) + 1
+    if isinstance(prompt_tokens, int):
+        AI_METRICS["prompt_tokens"] += prompt_tokens
+    if isinstance(completion_tokens, int):
+        AI_METRICS["completion_tokens"] += completion_tokens
+    if isinstance(total_tokens, int):
+        AI_METRICS["total_tokens"] += total_tokens
+
+    event = {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "prompt_tokens": prompt_tokens if prompt_tokens is not None else "-",
+        "completion_tokens": completion_tokens if completion_tokens is not None else "-",
+        "total_tokens": total_tokens if total_tokens is not None else "-",
+        "note": note,
+    }
+    AI_METRICS["events"].append(event)
+    AI_METRICS["events"] = AI_METRICS["events"][-MAX_EVENTS:]
+
+    log_stdout(
+        f"request provider={provider} model={model} status={status} "
+        f"prompt_tokens={event['prompt_tokens']} completion_tokens={event['completion_tokens']} "
+        f"total_tokens={event['total_tokens']} note={note or '-'}"
+    )
+
+
+def get_metrics():
+    return {
+        "requests": AI_METRICS["requests"],
+        "prompt_tokens": AI_METRICS["prompt_tokens"],
+        "completion_tokens": AI_METRICS["completion_tokens"],
+        "total_tokens": AI_METRICS["total_tokens"],
+        "by_provider": dict(AI_METRICS["by_provider"]),
+        "events": list(AI_METRICS["events"]),
+    }
+
+
+def reset_metrics():
+    AI_METRICS["requests"] = 0
+    AI_METRICS["prompt_tokens"] = 0
+    AI_METRICS["completion_tokens"] = 0
+    AI_METRICS["total_tokens"] = 0
+    AI_METRICS["by_provider"] = {"cerebras": 0, "gemini": 0}
+    AI_METRICS["events"] = []
 
 
 def model_name():
@@ -161,66 +229,95 @@ Assistant:
 
 
 def generate_plan_cerebras(question, provider_api_key, provider_model, retry_message=""):
-    response = requests.post(
-        CEREBRAS_URL,
-        headers={"Authorization": f"Bearer {provider_api_key}", "Content-Type": "application/json"},
-        json={
-            "model": provider_model,
-            "temperature": 0.1,
-            "max_tokens": 500,
-            "messages": [
-                {"role": "system", "content": system_prompt(retry_message)},
-                {"role": "user", "content": question},
-            ],
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    choices = payload.get("choices", [])
-    if not choices:
-        raise RuntimeError(f"Cerebras returned no choices: {payload}")
-    message = choices[0].get("message", {})
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content
-    if isinstance(content, list):
-        texts = [item.get("text", "") for item in content if isinstance(item, dict)]
-        merged = "".join(texts).strip()
-        if merged:
-            return merged
-    raise RuntimeError(f"Cerebras returned no usable message content: {payload}")
+    try:
+        response = requests.post(
+            CEREBRAS_URL,
+            headers={"Authorization": f"Bearer {provider_api_key}", "Content-Type": "application/json"},
+            json={
+                "model": provider_model,
+                "temperature": 0.1,
+                "max_tokens": 500,
+                "messages": [
+                    {"role": "system", "content": system_prompt(retry_message)},
+                    {"role": "user", "content": question},
+                ],
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        usage_raw = payload.get("usage", {})
+        usage = {
+            "prompt_tokens": usage_raw.get("prompt_tokens"),
+            "completion_tokens": usage_raw.get("completion_tokens"),
+            "total_tokens": usage_raw.get("total_tokens"),
+        }
+        choices = payload.get("choices", [])
+        if not choices:
+            record_request("cerebras", provider_model, usage, status="error", note="no choices")
+            raise RuntimeError(f"Cerebras returned no choices: {payload}")
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            record_request("cerebras", provider_model, usage, status="ok")
+            return content
+        if isinstance(content, list):
+            texts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            merged = "".join(texts).strip()
+            if merged:
+                record_request("cerebras", provider_model, usage, status="ok")
+                return merged
+        record_request("cerebras", provider_model, usage, status="error", note="no usable content")
+        raise RuntimeError(f"Cerebras returned no usable message content: {payload}")
+    except Exception as error:
+        if "payload" not in locals():
+            record_request("cerebras", provider_model, status="error", note=str(error))
+        raise
 
 
 def generate_plan_gemini(question, provider_api_key, provider_model, retry_message=""):
-    response = requests.post(
-        GEMINI_URL.format(model=provider_model),
-        headers={"x-goog-api-key": provider_api_key, "Content-Type": "application/json"},
-        json={
-            "contents": [
-                {
-                    "parts": [
-                        {"text": system_prompt(retry_message)},
-                        {"text": f"User request:\n{question}"},
-                    ]
-                }
-            ]
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    candidates = payload.get("candidates", [])
-    if not candidates:
-        raise RuntimeError(f"No Gemini output returned: {payload}")
-    candidate = candidates[0]
-    parts = candidate.get("content", {}).get("parts", [])
-    texts = [part.get("text", "") for part in parts if isinstance(part, dict)]
-    output = "".join(texts).strip()
-    if output:
-        return output
-    finish_reason = candidate.get("finishReason", "unknown")
-    raise RuntimeError(f"Gemini returned no text output. Finish reason: {finish_reason}. Payload: {payload}")
+    try:
+        response = requests.post(
+            GEMINI_URL.format(model=provider_model),
+            headers={"x-goog-api-key": provider_api_key, "Content-Type": "application/json"},
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": system_prompt(retry_message)},
+                            {"text": f"User request:\n{question}"},
+                        ]
+                    }
+                ]
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        usage_raw = payload.get("usageMetadata", {})
+        usage = {
+            "prompt_tokens": usage_raw.get("promptTokenCount"),
+            "completion_tokens": usage_raw.get("candidatesTokenCount"),
+            "total_tokens": usage_raw.get("totalTokenCount"),
+        }
+        candidates = payload.get("candidates", [])
+        if not candidates:
+            record_request("gemini", provider_model, usage, status="error", note="no candidates")
+            raise RuntimeError(f"No Gemini output returned: {payload}")
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        texts = [part.get("text", "") for part in parts if isinstance(part, dict)]
+        output = "".join(texts).strip()
+        if output:
+            record_request("gemini", provider_model, usage, status="ok")
+            return output
+        finish_reason = candidate.get("finishReason", "unknown")
+        record_request("gemini", provider_model, usage, status="error", note=f"no text: {finish_reason}")
+        raise RuntimeError(f"Gemini returned no text output. Finish reason: {finish_reason}. Payload: {payload}")
+    except Exception as error:
+        if "payload" not in locals():
+            record_request("gemini", provider_model, status="error", note=str(error))
+        raise
 
 
 def generate_plan(question, retry_message=""):
@@ -235,20 +332,24 @@ def resolve_query(db_path, question, max_attempts=3):
     retry_message = ""
     last_error = None
 
-    for _ in range(max_attempts):
+    for attempt in range(1, max_attempts + 1):
+        log_stdout(f"resolve attempt={attempt}/{max_attempts} question={question!r}")
         raw = generate_plan(question, retry_message)
         try:
             plan = parse_plan(raw)
             if plan["action"] == "ask_clarification":
+                log_stdout(f"planner requested clarification question={plan['clarification_question']!r}")
                 return plan
 
             sql = validate_sql(plan["sql"])
             validate_sql_with_sqlite(db_path, sql)
             rows = fetch_all(db_path, sql)
+            log_stdout(f"sql accepted rows={len(rows)}")
             return {"action": "run_sql", "sql": sql, "rows": rows}
         except Exception as error:
             last_error = error
             retry_message = str(error)
+            log_stdout(f"attempt failed reason={retry_message}")
 
     raise RuntimeError(f"Could not produce a valid AI query. Last error: {last_error}")
 
