@@ -1,0 +1,39 @@
+import os
+
+from cvedb.db import init_db
+from cvedb.entry import run as run_entry
+from cvedb.imports import run as run_imports
+from cvedb.query import run as run_query
+from cvedb.sync import run as run_sync
+
+
+def main():
+    db_path = os.getenv("CVE_DB_PATH", "cve.db")
+    init_db(db_path)
+
+    while True:
+        print("\nCybersteps CVE DB")
+        print(f"Database: {db_path}")
+        print("1. Manual entry and lookup")
+        print("2. Import and analysis")
+        print("3. NVD sync")
+        print("4. AI query")
+        print("0. Exit")
+        choice = input("Choose: ").strip()
+
+        if choice == "1":
+            run_entry(db_path)
+        elif choice == "2":
+            run_imports(db_path)
+        elif choice == "3":
+            run_sync(db_path)
+        elif choice == "4":
+            run_query(db_path)
+        elif choice == "0":
+            return
+        else:
+            print("Invalid choice.")
+
+
+if __name__ == "__main__":
+    main()

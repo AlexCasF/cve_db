@@ -1,0 +1,1 @@
+"""Minimal CVE database package."""

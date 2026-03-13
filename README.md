@@ -1,37 +1,39 @@
-﻿# Cybersteps CVE DB
+# Cybersteps CVE DB
 
-Single-file Streamlit app for a relational CVE database.
+Small CLI project for the CVE database assignment.
 
-## Quick Start
-
-1. Create and activate a virtual environment.
-2. Install dependencies:
+## Setup
 
 ```powershell
+python -m venv venv
+.\venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Run the app:
+## Run
 
 ```powershell
-streamlit run app.py
+python main.py
 ```
 
-## Optional Env Vars
+## Project Layout
 
-- `CVE_DB_PATH` (default: `cve.db`)
-- `NVD_API_KEY`
-- `CEREBRAS_API_KEY`
-- `CEREBRAS_MODEL` (default in app sidebar)
+- `main.py`: top-level menu
+- `cvedb/db.py`: SQLite connection, schema setup, shared helpers
+- `cvedb/entry.py`: manual entry and lookup by CVE ID
+- `cvedb/imports.py`: file import, stats, and filters
+- `cvedb/sync.py`: NVD sync with `requests`
+- `cvedb/query.py`: AI-generated SQL with a clarification step
+- `schema.sql`: relational schema
 
-## What This MVP Includes
+## Environment Variables
 
-- SQLite schema and auto-init
-- Manual CVE entry + lookup by CVE ID
-- Bulk import from CSV/JSON
-- NVD API sync by date range
-- SQL analytics + filters
-- CVE relation visualization (vendor/product)
-- Natural language to SQL (Cerebras), with read-only SQL safety checks
+- `CVE_DB_PATH`: SQLite file path, default `cve.db`
+- `NVD_API_KEY`: optional, used for NVD sync
+- `CEREBRAS_API_KEY`: optional, used for AI queries
+- `CEREBRAS_MODEL`: optional, default `llama-4-scout-17b-16e-instruct`
 
-- schema.sql contains the same relational schema used by the app.
+## Notes
+
+- The AI query menu is optional at runtime if you do not have an AI API key.
+- Use DB Browser for SQLite to inspect `cve.db` directly.
