@@ -3,17 +3,71 @@ import os
 import re
 import sqlite3
 from datetime import date, datetime
+from functools import lru_cache
+from typing import Literal
 
-import requests
+from cerebras.cloud.sdk import Cerebras
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from db import fetch_all, print_rows
 
 
-CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+load_dotenv()
+
 ALLOWED_TABLES = {"cves", "vendors", "products", "cve_products"}
 MAX_EVENTS = 20
+
+
+class Plan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["ask_clarification", "run_sql"]
+    clarification_question: str | None = None
+    sql: str | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self):
+        if self.action == "ask_clarification":
+            if not (self.clarification_question or "").strip():
+                raise ValueError("clarification_question is required for ask_clarification.")
+            if self.sql is not None:
+                raise ValueError("sql must be null for ask_clarification.")
+        if self.action == "run_sql":
+            if not (self.sql or "").strip():
+                raise ValueError("sql is required for run_sql.")
+            if self.clarification_question is not None:
+                raise ValueError("clarification_question must be null for run_sql.")
+        return self
+
+
+PLAN_SCHEMA = Plan.model_json_schema()
+SYSTEM_PROMPT = (
+    "You are an NL-to-SQL planner for SQLite.\n"
+    "Return only JSON that matches the provided schema.\n"
+    "Rules:\n"
+    "- Use only these tables: cves, vendors, products, cve_products.\n"
+    "- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA, ATTACH, VACUUM, or other mutating SQL.\n"
+    "- Ask a clarification question only when the request is genuinely too vague to produce a useful SQL query.\n"
+    "- Do not ask a clarification question just because the user said latest, newest, most recent, or last added.\n"
+    "- If the user asks for the latest or newest bug, sort by COALESCE(c.published, c.last_modified) DESC and return the single newest relevant row unless the user explicitly asks for more.\n"
+    "- For product, project, vendor, or keyword searches, search across cves.cve_id, cves.description, vendors.name, and products.name when relevant.\n"
+    "- Use SQLite syntax only.\n"
+    "- Prefer short, useful SELECT queries with LIMIT 20 unless the user clearly wants one row or an aggregate.\n"
+    f"- Today's date is {date.today().isoformat()}.\n"
+    "Schema:\n"
+    "cves(cve_id, description, published, last_modified, severity, cvss_score, source, url)\n"
+    "vendors(vendor_id, name)\n"
+    "products(product_id, vendor_id, name)\n"
+    "cve_products(cve_id, product_id)\n"
+    "Examples in prose:\n"
+    "- 'show me the latest added openclaw bug' should search for openclaw, order newest first, and return one row.\n"
+    "- 'show me the bad ones' should ask what CVSS threshold counts as bad.\n"
+    "- 'show me Microsoft bugs from last month' should filter Microsoft-related rows and the previous calendar month.\n"
+    "- 'what is the average risk score in my database' should return an aggregate query.\n"
+)
 AI_METRICS = {
     "requests": 0,
     "prompt_tokens": 0,
@@ -24,11 +78,110 @@ AI_METRICS = {
 }
 
 
+def model_name():
+    load_dotenv()
+    return os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+
+def api_key():
+    load_dotenv()
+    return os.getenv("CEREBRAS_API_KEY", "")
+
+
+def gemini_model():
+    load_dotenv()
+    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def gemini_api_key():
+    load_dotenv()
+    return os.getenv("GEMINI_API_KEY", "")
+
+
+@lru_cache(maxsize=1)
+def cerebras_client():
+    key = api_key()
+    if not key:
+        return None
+    return Cerebras(
+        api_key=key,
+        max_retries=0,
+        timeout=30.0,
+        warm_tcp_connection=False,
+    )
+
+
+@lru_cache(maxsize=1)
+def gemini_client():
+    key = gemini_api_key()
+    if not key:
+        return None
+    return genai.Client(
+        api_key=key,
+        http_options=genai_types.HttpOptions(
+            retry_options=genai_types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+
+def apply_clarification(question, answer):
+    return f"Original request: {question}\nClarification from user: {answer}"
+
+
 def log_stdout(message):
     print(f"[AI] {message}")
 
 
-def record_request(provider, model, usage=None, status="ok", note=""):
+def _read_value(obj, *names):
+    if obj is None:
+        return None
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def _error_status(error):
+    return _read_value(error, "status_code", "status")
+
+
+def _error_note(error):
+    parts = [error.__class__.__name__]
+    status = _error_status(error)
+    if status is not None:
+        parts.append(f"status={status}")
+
+    message = _read_value(error, "message")
+    if message:
+        parts.append(str(message).replace("\n", " "))
+    elif str(error):
+        parts.append(str(error).replace("\n", " "))
+
+    body = _read_value(error, "body")
+    if isinstance(body, dict):
+        detail = body.get("message") or body.get("error") or body.get("details")
+        if detail:
+            parts.append(str(detail).replace("\n", " "))
+
+    return " | ".join(parts)
+
+
+def _content_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            text = _read_value(item, "text")
+            if text:
+                parts.append(str(text))
+        return "".join(parts).strip()
+    return str(content or "").strip()
+
+
+def record_request(provider, model, usage=None, status="ok", note="", http_status=None):
     usage = usage or {}
     prompt_tokens = usage.get("prompt_tokens")
     completion_tokens = usage.get("completion_tokens")
@@ -48,6 +201,7 @@ def record_request(provider, model, usage=None, status="ok", note=""):
         "provider": provider,
         "model": model,
         "status": status,
+        "http_status": http_status if http_status is not None else "-",
         "prompt_tokens": prompt_tokens if prompt_tokens is not None else "-",
         "completion_tokens": completion_tokens if completion_tokens is not None else "-",
         "total_tokens": total_tokens if total_tokens is not None else "-",
@@ -58,8 +212,9 @@ def record_request(provider, model, usage=None, status="ok", note=""):
 
     log_stdout(
         f"request provider={provider} model={model} status={status} "
-        f"prompt_tokens={event['prompt_tokens']} completion_tokens={event['completion_tokens']} "
-        f"total_tokens={event['total_tokens']} note={note or '-'}"
+        f"http_status={event['http_status']} prompt_tokens={event['prompt_tokens']} "
+        f"completion_tokens={event['completion_tokens']} total_tokens={event['total_tokens']} "
+        f"note={note or '-'}"
     )
 
 
@@ -83,56 +238,11 @@ def reset_metrics():
     AI_METRICS["events"] = []
 
 
-def model_name():
-    load_dotenv()
-    return os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
-
-
-def api_key():
-    load_dotenv()
-    return os.getenv("CEREBRAS_API_KEY", "")
-
-
-def gemini_model():
-    load_dotenv()
-    return os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-
-def gemini_api_key():
-    load_dotenv()
-    return os.getenv("GEMINI_API_KEY", "")
-
-
-def apply_clarification(question, answer):
-    return f"Original request: {question}\nClarification from user: {answer}"
-
-
-def extract_json(text):
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.IGNORECASE | re.DOTALL)
-    if fenced:
-        return fenced.group(1).strip()
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"Model did not return JSON: {text}")
-    return text[start : end + 1]
-
-
 def parse_plan(text):
-    payload = json.loads(extract_json(text))
-    action = payload.get("action")
-    if action == "ask_clarification":
-        question = str(payload.get("clarification_question", "")).strip()
-        if not question:
-            raise ValueError("Missing clarification_question in model response.")
-        return {"action": "ask_clarification", "clarification_question": question}
-    if action == "run_sql":
-        sql = str(payload.get("sql", "")).strip()
-        if not sql:
-            raise ValueError("Missing sql in model response.")
-        return {"action": "run_sql", "sql": sql}
-    raise ValueError(f"Unsupported action in model response: {payload}")
+    plan = Plan.model_validate_json(text)
+    if plan.action == "ask_clarification":
+        return {"action": "ask_clarification", "clarification_question": plan.clarification_question.strip()}
+    return {"action": "run_sql", "sql": plan.sql.strip()}
 
 
 def extract_sql(text):
@@ -164,171 +274,121 @@ def validate_sql_with_sqlite(db_path, sql):
         connection.execute(f"EXPLAIN QUERY PLAN {sql}")
 
 
-def system_prompt(retry_message=""):
-    examples = """
-Example 1
-User: show me the latest added openclaw bug
-Assistant:
-{
-  "action": "run_sql",
-  "sql": "SELECT c.cve_id, c.description, c.published, c.last_modified, c.severity, c.cvss_score, c.source, c.url FROM cves c LEFT JOIN cve_products cp ON cp.cve_id = c.cve_id LEFT JOIN products p ON p.product_id = cp.product_id LEFT JOIN vendors v ON v.vendor_id = p.vendor_id WHERE LOWER(c.cve_id) LIKE '%openclaw%' OR LOWER(c.description) LIKE '%openclaw%' OR LOWER(v.name) LIKE '%openclaw%' OR LOWER(p.name) LIKE '%openclaw%' GROUP BY c.cve_id ORDER BY COALESCE(c.published, c.last_modified) DESC, c.last_modified DESC LIMIT 1"
-}
-
-Example 2
-User: show me the bad ones
-Assistant:
-{
-  "action": "ask_clarification",
-  "clarification_question": "What CVSS score should count as bad?"
-}
-
-Example 3
-User: show me Microsoft bugs from last month
-Assistant:
-{
-  "action": "run_sql",
-  "sql": "SELECT DISTINCT c.cve_id, c.description, c.published, c.severity, c.cvss_score FROM cves c LEFT JOIN cve_products cp ON cp.cve_id = c.cve_id LEFT JOIN products p ON p.product_id = cp.product_id LEFT JOIN vendors v ON v.vendor_id = p.vendor_id WHERE LOWER(v.name) LIKE '%microsoft%' AND date(substr(c.published, 1, 10)) >= date('now', 'start of month', '-1 month') AND date(substr(c.published, 1, 10)) < date('now', 'start of month') ORDER BY c.published DESC"
-}
-
-Example 4
-User: what is the average risk score in my database
-Assistant:
-{
-  "action": "run_sql",
-  "sql": "SELECT ROUND(AVG(cvss_score), 2) AS average_cvss_score FROM cves"
-}
-""".strip()
-
+def user_prompt(question, retry_message=""):
     retry_block = ""
     if retry_message:
-        retry_block = f"\nPrevious attempt was invalid. Fix it.\nValidation error: {retry_message}\n"
-
-    return (
-        "You are an NL-to-SQL planner for SQLite.\n"
-        "You must return JSON only.\n"
-        "Valid response shapes:\n"
-        '1. {"action":"ask_clarification","clarification_question":"..."}\n'
-        '2. {"action":"run_sql","sql":"SELECT ..."}\n'
-        "Rules:\n"
-        "- Use only these tables: cves, vendors, products, cve_products.\n"
-        "- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA, ATTACH, VACUUM, or other mutating SQL.\n"
-        "- If the user asks for the latest, newest, most recent, or last added item, sort descending by COALESCE(c.published, c.last_modified) and return only the newest relevant row unless the user explicitly asks for multiple rows.\n"
-        "- For topic words such as vendor, product, or project names, search across cves.cve_id, cves.description, vendors.name, and products.name when relevant.\n"
-        "- Ask a clarification question only when the request is genuinely ambiguous and a reasonable SQL query cannot be formed.\n"
-        "- Do not ask a clarification question just because the user said latest or newest.\n"
-        "- Prefer concise, useful SELECT queries.\n"
-        f"- Today's date is {date.today().isoformat()}.\n"
-        "Schema:\n"
-        "cves(cve_id, description, published, last_modified, severity, cvss_score, source, url)\n"
-        "vendors(vendor_id, name)\n"
-        "products(product_id, vendor_id, name)\n"
-        "cve_products(cve_id, product_id)\n"
-        f"{retry_block}\n"
-        f"{examples}\n"
-    )
-
-
-def generate_plan_cerebras(question, provider_api_key, provider_model, retry_message=""):
-    try:
-        response = requests.post(
-            CEREBRAS_URL,
-            headers={"Authorization": f"Bearer {provider_api_key}", "Content-Type": "application/json"},
-            json={
-                "model": provider_model,
-                "temperature": 0.1,
-                "max_tokens": 500,
-                "messages": [
-                    {"role": "system", "content": system_prompt(retry_message)},
-                    {"role": "user", "content": question},
-                ],
-            },
-            timeout=60,
+        retry_block = (
+            "Previous attempt was invalid. Fix it.\n"
+            f"Validation error: {retry_message}\n"
         )
-        response.raise_for_status()
-        payload = response.json()
-        usage_raw = payload.get("usage", {})
-        usage = {
-            "prompt_tokens": usage_raw.get("prompt_tokens"),
-            "completion_tokens": usage_raw.get("completion_tokens"),
-            "total_tokens": usage_raw.get("total_tokens"),
-        }
-        choices = payload.get("choices", [])
-        if not choices:
-            record_request("cerebras", provider_model, usage, status="error", note="no choices")
-            raise RuntimeError(f"Cerebras returned no choices: {payload}")
-        message = choices[0].get("message", {})
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            record_request("cerebras", provider_model, usage, status="ok")
-            return content
-        if isinstance(content, list):
-            texts = [item.get("text", "") for item in content if isinstance(item, dict)]
-            merged = "".join(texts).strip()
-            if merged:
-                record_request("cerebras", provider_model, usage, status="ok")
-                return merged
-        record_request("cerebras", provider_model, usage, status="error", note="no usable content")
-        raise RuntimeError(f"Cerebras returned no usable message content: {payload}")
+    return f"{retry_block}User request:\n{question}"
+
+
+def _cerebras_usage(completion):
+    usage = _read_value(completion, "usage")
+    return {
+        "prompt_tokens": _read_value(usage, "prompt_tokens"),
+        "completion_tokens": _read_value(usage, "completion_tokens"),
+        "total_tokens": _read_value(usage, "total_tokens"),
+    }
+
+
+def _gemini_usage(response):
+    usage = _read_value(response, "usage_metadata", "usageMetadata")
+    return {
+        "prompt_tokens": _read_value(usage, "prompt_token_count", "promptTokenCount"),
+        "completion_tokens": _read_value(usage, "candidates_token_count", "candidatesTokenCount"),
+        "total_tokens": _read_value(usage, "total_token_count", "totalTokenCount"),
+    }
+
+
+def generate_plan_cerebras(question, retry_message=""):
+    client = cerebras_client()
+    model = model_name()
+    if client is None:
+        raise RuntimeError("Cerebras client is not configured.")
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            max_completion_tokens=220,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt(question, retry_message)},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "nl_sql_plan",
+                    "strict": True,
+                    "schema": PLAN_SCHEMA,
+                },
+            },
+        )
+        usage = _cerebras_usage(completion)
+        content = _content_text(_read_value(completion.choices[0].message, "content"))
+        if not content:
+            record_request("cerebras", model, usage, status="error", note="no content")
+            raise RuntimeError("Cerebras returned no structured content.")
+        record_request("cerebras", model, usage, status="ok")
+        return content
     except Exception as error:
-        if "payload" not in locals():
-            record_request("cerebras", provider_model, status="error", note=str(error))
+        record_request(
+            "cerebras",
+            model,
+            status="error",
+            note=_error_note(error),
+            http_status=_error_status(error),
+        )
         raise
 
 
-def generate_plan_gemini(question, provider_api_key, provider_model, retry_message=""):
+def generate_plan_gemini(question, retry_message=""):
+    client = gemini_client()
+    model = gemini_model()
+    if client is None:
+        raise RuntimeError("Gemini client is not configured.")
+
     try:
-        response = requests.post(
-            GEMINI_URL.format(model=provider_model),
-            headers={"x-goog-api-key": provider_api_key, "Content-Type": "application/json"},
-            json={
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": system_prompt(retry_message)},
-                            {"text": f"User request:\n{question}"},
-                        ]
-                    }
-                ]
-            },
-            timeout=60,
+        response = client.models.generate_content(
+            model=model,
+            contents=user_prompt(question, retry_message),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0,
+                max_output_tokens=220,
+                response_mime_type="application/json",
+                response_json_schema=PLAN_SCHEMA,
+            ),
         )
-        response.raise_for_status()
-        payload = response.json()
-        usage_raw = payload.get("usageMetadata", {})
-        usage = {
-            "prompt_tokens": usage_raw.get("promptTokenCount"),
-            "completion_tokens": usage_raw.get("candidatesTokenCount"),
-            "total_tokens": usage_raw.get("totalTokenCount"),
-        }
-        candidates = payload.get("candidates", [])
-        if not candidates:
-            record_request("gemini", provider_model, usage, status="error", note="no candidates")
-            raise RuntimeError(f"No Gemini output returned: {payload}")
-        candidate = candidates[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        texts = [part.get("text", "") for part in parts if isinstance(part, dict)]
-        output = "".join(texts).strip()
-        if output:
-            record_request("gemini", provider_model, usage, status="ok")
-            return output
-        finish_reason = candidate.get("finishReason", "unknown")
-        record_request("gemini", provider_model, usage, status="error", note=f"no text: {finish_reason}")
-        raise RuntimeError(f"Gemini returned no text output. Finish reason: {finish_reason}. Payload: {payload}")
+        usage = _gemini_usage(response)
+        text = _content_text(_read_value(response, "text"))
+        if not text:
+            record_request("gemini", model, usage, status="error", note="no text")
+            raise RuntimeError("Gemini returned no structured text.")
+        record_request("gemini", model, usage, status="ok")
+        return text
     except Exception as error:
-        if "payload" not in locals():
-            record_request("gemini", provider_model, status="error", note=str(error))
+        record_request(
+            "gemini",
+            model,
+            status="error",
+            note=_error_note(error),
+            http_status=_error_status(error),
+        )
         raise
 
 
 def generate_plan(question, retry_message=""):
     if api_key():
-        return generate_plan_cerebras(question, api_key(), model_name(), retry_message)
+        return generate_plan_cerebras(question, retry_message)
     if gemini_api_key():
-        return generate_plan_gemini(question, gemini_api_key(), gemini_model(), retry_message)
+        return generate_plan_gemini(question, retry_message)
     raise RuntimeError("Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use AI query.")
 
 
-def resolve_query(db_path, question, max_attempts=3):
+def resolve_query(db_path, question, max_attempts=1):
     retry_message = ""
     last_error = None
 
