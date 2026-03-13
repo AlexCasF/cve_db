@@ -18,7 +18,35 @@ from db import fetch_all, print_rows
 
 load_dotenv()
 
-ALLOWED_TABLES = {"cves", "vendors", "products", "cve_products"}
+ALLOWED_TABLES = {
+    "cves",
+    "vendors",
+    "products",
+    "cve_products",
+    "cve_tags",
+    "cve_descriptions",
+    "cve_metrics",
+    "cve_weaknesses",
+    "cve_weakness_descriptions",
+    "cve_references",
+    "cve_reference_tags",
+    "cve_configurations",
+    "cve_nodes",
+    "cve_matches",
+    "cve_match_names",
+    "nvd_cpes",
+    "nvd_cpe_titles",
+    "nvd_cpe_refs",
+    "nvd_cpe_deprecates",
+    "nvd_cpe_deprecated_by",
+    "nvd_match_strings",
+    "nvd_match_string_matches",
+    "nvd_sources",
+    "nvd_source_identifiers",
+    "nvd_source_acceptance_levels",
+    "nvd_cve_changes",
+    "nvd_cve_change_details",
+}
 MAX_EVENTS = 20
 PROVIDER_MIN_INTERVAL = {
     "cerebras": 2.1,
@@ -53,39 +81,55 @@ class Plan(BaseModel):
 
 
 PLAN_SCHEMA = Plan.model_json_schema()
-SYSTEM_PROMPT = (
-    "Plan SQLite queries for a CVE database and return JSON matching the provided schema.\n"
-    "Tables: cves(cve_id, description, published, last_modified, severity, cvss_score, source, url), "
-    "vendors(vendor_id, name), products(product_id, vendor_id, name), cve_products(cve_id, product_id).\n"
-    f"Today is {date.today().isoformat()}.\n"
-    "Core rules:\n"
-    "- Generate SELECT queries only.\n"
-    "- Use only cves, vendors, products, cve_products.\n"
-    "- Use SQLite syntax.\n"
-    "- Ask one clarification question only if the request is too vague to query usefully.\n"
-    "- latest/newest/last added means order by COALESCE(c.published, c.last_modified) DESC.\n"
-    "- If the user asks for a single bug, return one row with LIMIT 1.\n"
-    "- If the user asks for multiple results, use the requested count; otherwise use LIMIT 20 by default.\n"
-    "- When joining through cve_products/products/vendors to list CVEs, prefer SELECT DISTINCT to avoid duplicates.\n"
-    "Name matching rules:\n"
-    "- Vendor and product names in this database are often normalized lowercase.\n"
-    "- For vendor/product/company/product-name text matching, prefer case-insensitive matching such as LOWER(v.name) LIKE '%term%' or LOWER(p.name) LIKE '%term%'.\n"
-    "- Do not rely on case-sensitive equality for names unless the user clearly provides an exact canonical database value.\n"
-    "- If the user gives a company or vendor name such as 'microsoft', first try matching vendors.name.\n"
-    "- If the user gives a product/platform/ecosystem term such as 'linux', 'windows', or 'office', use broader matching across cves.cve_id, cves.description, vendors.name, and products.name.\n"
-    "- If the term is ambiguous, prefer broader keyword matching over a narrow exact filter.\n"
-    "Query broadening rules:\n"
-    "- Avoid overly narrow exact-name filters when a fuzzy match would be safer.\n"
-    "- If a first-pass interpretation would likely be brittle, prefer the broader robust version immediately.\n"
-    "- For company/vendor searches that might miss due to normalization, prefer LOWER(name) LIKE over exact equality.\n"
-    "- For general keyword searches, a robust pattern is OR matching across c.cve_id, c.description, v.name, and p.name.\n"
-    "Examples:\n"
-    "- 'show me the latest openclaw bug': search broadly enough to find openclaw, order newest first, return one row.\n"
-    "- 'show me the latest linux bug': use broad keyword matching across CVE ID, description, vendor, and product, order newest first, return one row.\n"
-    "- 'show me the latest 20 microsoft issues': treat microsoft as a vendor/company term, use case-insensitive vendor matching, order newest first, and return 20 CVEs.\n"
-    "- 'show me microsoft issues above 8.0': filter Microsoft-related CVEs and apply the score threshold.\n"
-    "- 'show me the bad ones': ask what CVSS threshold counts as bad.\n"
-)
+SYSTEM_PROMPT = f"""
+Return only JSON matching the provided schema. No markdown, no prose, no code fences. Keep the JSON minified and the SQL on one line.
+Today is {date.today().isoformat()}.
+
+Allowed tables:
+- cves, vendors, products, cve_products
+- cve_tags, cve_descriptions, cve_metrics, cve_weaknesses, cve_weakness_descriptions, cve_references, cve_reference_tags
+- cve_configurations, cve_nodes, cve_matches, cve_match_names
+- nvd_cpes, nvd_cpe_titles, nvd_cpe_refs, nvd_cpe_deprecates, nvd_cpe_deprecated_by
+- nvd_match_strings, nvd_match_string_matches
+- nvd_sources, nvd_source_identifiers, nvd_source_acceptance_levels
+- nvd_cve_changes, nvd_cve_change_details
+
+Use SELECT only. Never use raw_* tables or sync_state.
+Ask one clarification question only if the request is too vague.
+For latest/newest, order CVEs by COALESCE(c.published, c.last_modified) DESC.
+For one bug use LIMIT 1. Otherwise use the requested count or LIMIT 20.
+Prefer the shortest correct SQL. Use DISTINCT when joins can duplicate CVEs.
+
+Use cves first for simple CVE listing, score/date filters, and keyword searches.
+For normal CVE result lists, prefer these columns when available: cve_id, description, published, last_modified, severity, cvss_score, source_identifier, source, url.
+Use the official product path only when vendor/product identity matters:
+cves.cve_id = cve_configurations.cve_id
+cve_configurations.configuration_id = cve_nodes.configuration_id
+cve_nodes.node_id = cve_matches.node_id
+cve_matches.match_criteria_id = nvd_match_strings.match_criteria_id
+nvd_match_strings.match_criteria_id = nvd_match_string_matches.match_criteria_id
+nvd_match_string_matches.cpe_name_id = nvd_cpes.cpe_name_id
+Important: nvd_match_strings has no match_id column.
+
+Use nvd_sources and nvd_source_identifiers for source/CNA/assigner/provider questions.
+Use nvd_cve_changes and nvd_cve_change_details for history/what-changed questions.
+
+Matching guidance:
+- vendor/product names are often lowercase
+- prefer LOWER(column) LIKE '%term%' for names
+- for company terms like microsoft, adobe, oracle: prefer official CPE vendor matching
+- for product/platform terms like linux, windows, openssh, openclaw: prefer broad matching across cves.description, cves.cve_id, nvd_cpes.vendor, nvd_cpes.product, and nvd_cpe_titles.title when useful
+- if a broad cves query answers the question, prefer it over a long mirror join
+- non-obvious text columns: cves.description is the main summary text, cve_descriptions uses value, nvd_cpe_titles uses title, nvd_cve_change_details has action/type/old_value/new_value and no description column
+
+Examples:
+- latest openclaw bug -> broad CVE/product keyword search, newest first, LIMIT 1
+- latest 5 openclaw bugs -> same pattern, LIMIT 5
+- latest 20 microsoft issues -> official CPE vendor matching, DISTINCT CVEs, newest first
+- CVEs whose source is MITRE -> source_identifier join to nvd_sources/nvd_source_identifiers
+- what changed for CVE-2024-1234 -> nvd_cve_changes join nvd_cve_change_details ordered by created
+- bad ones -> ask what CVSS threshold counts as bad
+""".strip()
 AI_METRICS = {
     "requests": 0,
     "prompt_tokens": 0,
@@ -94,6 +138,17 @@ AI_METRICS = {
     "by_provider": {"cerebras": 0, "gemini": 0},
     "events": [],
 }
+DEFAULT_CVE_COLUMNS = [
+    "cve_id",
+    "description",
+    "published",
+    "last_modified",
+    "severity",
+    "cvss_score",
+    "source_identifier",
+    "source",
+    "url",
+]
 
 
 def model_name():
@@ -349,9 +404,31 @@ def validate_sql(sql):
         raise ValueError("Only SELECT queries are allowed.")
     if re.search(r"\b(insert|update|delete|drop|alter|create|pragma|attach|vacuum|replace|truncate)\b", cleaned, re.IGNORECASE):
         raise ValueError("Unsafe SQL blocked.")
-    for table in re.findall(r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)", cleaned, re.IGNORECASE):
-        if table.lower() not in ALLOWED_TABLES:
+    alias_map = {}
+    table_refs = re.findall(
+        r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?",
+        cleaned,
+        re.IGNORECASE,
+    )
+    for table, alias in table_refs:
+        table_lower = table.lower()
+        if table_lower not in ALLOWED_TABLES:
             raise ValueError(f"Table not allowed: {table}")
+        alias_map[table_lower] = table_lower
+        if alias:
+            alias_map[alias.lower()] = table_lower
+
+    wrong_column_hints = {
+        "cve_descriptions": {"description": "value"},
+        "nvd_cpe_titles": {"description": "title"},
+        "nvd_cve_change_details": {"description": "action/type/old_value/new_value"},
+    }
+    for alias, table in alias_map.items():
+        for wrong_column, correct_column in wrong_column_hints.get(table, {}).items():
+            if re.search(rf"\b{re.escape(alias)}\.{re.escape(wrong_column)}\b", cleaned, re.IGNORECASE):
+                raise ValueError(
+                    f"{table} does not have {wrong_column}; use {correct_column} instead."
+                )
     if not re.search(r"\blimit\b", cleaned, re.IGNORECASE):
         cleaned = f"{cleaned} LIMIT 20"
     return cleaned
@@ -362,14 +439,70 @@ def validate_sql_with_sqlite(db_path, sql):
         connection.execute(f"EXPLAIN QUERY PLAN {sql}")
 
 
+def enrich_cve_rows(db_path, rows):
+    if not rows:
+        return rows
+    if "cve_id" not in rows[0]:
+        return rows
+    if all(column in rows[0] for column in DEFAULT_CVE_COLUMNS):
+        return rows
+
+    cve_ids = []
+    for row in rows:
+        cve_id = row.get("cve_id")
+        if cve_id and cve_id not in cve_ids:
+            cve_ids.append(cve_id)
+    if not cve_ids:
+        return rows
+
+    placeholders = ",".join("?" for _ in cve_ids)
+    details = fetch_all(
+        db_path,
+        f"""
+        SELECT cve_id, description, published, last_modified, severity, cvss_score, source_identifier, source, url
+        FROM cves
+        WHERE cve_id IN ({placeholders})
+        """,
+        tuple(cve_ids),
+    )
+    detail_map = {row["cve_id"]: row for row in details}
+
+    enriched = []
+    for row in rows:
+        detail = detail_map.get(row.get("cve_id"), {})
+        merged = {}
+        for column in DEFAULT_CVE_COLUMNS:
+            if column in row:
+                merged[column] = row[column]
+            elif column in detail:
+                merged[column] = detail[column]
+        for key, value in row.items():
+            if key not in merged:
+                merged[key] = value
+        enriched.append(merged)
+    return enriched
+
+
 def user_prompt(question, retry_message=""):
     retry_block = ""
     if retry_message:
+        extra_hint = ""
+        if "no such column" in retry_message.lower() or "does not have" in retry_message.lower():
+            extra_hint = (
+                "Re-check the real column names. Use cves.description for the main CVE summary, "
+                "cve_descriptions.value for multilingual descriptions, nvd_cpe_titles.title for CPE titles, "
+                "and nvd_cve_change_details.action/type/old_value/new_value for change-history details.\n"
+            )
         retry_block = (
             "Previous attempt was invalid. Fix it.\n"
             f"Validation error: {retry_message}\n"
+            f"{extra_hint}"
         )
-    return f"{retry_block}User request:\n{question}"
+    return (
+        f"{retry_block}"
+        "Return minified JSON only. No markdown. No explanations. SQL must be one line.\n"
+        f"User request:\n{question}"
+    )
 
 
 def _cerebras_usage(completion):
@@ -405,7 +538,7 @@ def generate_plan_cerebras(question, retry_message="", status_callback=None):
             reasoning_effort="low",
             reasoning_format="hidden",
             temperature=0,
-            max_completion_tokens=384,
+            max_completion_tokens=512,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt(question, retry_message)},
@@ -510,7 +643,7 @@ def generate_plan(question, retry_message="", status_callback=None, provider=Non
     raise RuntimeError("Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use AI query.")
 
 
-def resolve_query(db_path, question, max_attempts=1, status_callback=None, provider=None):
+def resolve_query(db_path, question, max_attempts=2, status_callback=None, provider=None):
     retry_message = ""
     last_error = None
 
@@ -529,6 +662,7 @@ def resolve_query(db_path, question, max_attempts=1, status_callback=None, provi
             validate_sql_with_sqlite(db_path, sql)
             notify_status(status_callback, "Running the query...")
             rows = fetch_all(db_path, sql)
+            rows = enrich_cve_rows(db_path, rows)
             notify_status(status_callback, "Query complete. Preparing the results...")
             log_stdout(f"sql accepted rows={len(rows)}")
             return {"action": "run_sql", "sql": sql, "rows": rows}
