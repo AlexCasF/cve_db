@@ -1,13 +1,15 @@
 import os
 
-from cvedb.db import init_db
-from cvedb.entry import run as run_entry
-from cvedb.imports import run as run_imports
-from cvedb.query import run as run_query
-from cvedb.sync import run as run_sync
+from db import init_db
+from entry import run as run_entry
+from imports import run as run_imports
+from query import run as run_query
+from sync import run as run_sync
+from dotenv import load_dotenv
 
 
 def main():
+    load_dotenv()
     db_path = os.getenv("CVE_DB_PATH", "cve.db")
     init_db(db_path)
 
