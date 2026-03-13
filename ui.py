@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from db import fetch_all, fetch_one, init_db, save_records
 from imports import find_cves, get_stats, get_top_vendors, load_records
-from query import api_key, apply_clarification, gemini_api_key, get_clarification, run_query_with_text
+from query import api_key, apply_clarification, gemini_api_key, resolve_query
 from sync import sync_recent
 
 
@@ -215,30 +215,25 @@ def render_chat(db_path):
         st.rerun()
 
     pending_question = st.session_state.pending_question
-    if pending_question is None:
-        clarification = get_clarification(prompt)
-        if clarification is not None:
-            question, default = clarification
-            st.session_state.pending_question = prompt
-            st.session_state.messages.append(
-                {"role": "assistant", "content": f"{question} [{default}]"}
-            )
-            st.rerun()
-        full_question = prompt
-    else:
-        st.session_state.pending_question = None
-        full_question = apply_clarification(pending_question, prompt)
+    full_question = prompt if pending_question is None else apply_clarification(pending_question, prompt)
 
     try:
-        sql, rows = run_query_with_text(db_path, full_question)
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": f"Returned {len(rows)} row(s).",
-                "sql": sql,
-                "rows": rows,
-            }
-        )
+        result = resolve_query(db_path, full_question)
+        if result["action"] == "ask_clarification":
+            st.session_state.pending_question = full_question
+            st.session_state.messages.append(
+                {"role": "assistant", "content": result["clarification_question"]}
+            )
+        else:
+            st.session_state.pending_question = None
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"Returned {len(result['rows'])} row(s).",
+                    "sql": result["sql"],
+                    "rows": result["rows"],
+                }
+            )
     except Exception as error:
         st.session_state.messages.append({"role": "assistant", "content": f"Query failed: {error}"})
     st.rerun()
