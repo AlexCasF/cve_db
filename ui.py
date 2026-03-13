@@ -6,7 +6,16 @@ from dotenv import load_dotenv
 
 from db import fetch_all, fetch_one, init_db, save_records
 from imports import find_cves, get_stats, get_top_vendors, load_records
-from query import api_key, apply_clarification, gemini_api_key, get_metrics, reset_metrics, resolve_query
+from query import (
+    api_key,
+    apply_clarification,
+    available_providers,
+    gemini_api_key,
+    get_metrics,
+    preferred_provider,
+    reset_metrics,
+    resolve_query,
+)
 from sync import sync_recent
 
 
@@ -188,8 +197,99 @@ def render_analytics(db_path):
 def render_chat(db_path):
     st.subheader("NL to SQL chat")
     st.caption("Chat idea: keep SQL visible, let the user refine filters, and show the result table below each reply.")
+    providers = available_providers()
+    provider_labels = {"cerebras": "Cerebras", "gemini": "Google"}
+
+    if "chat_provider" not in st.session_state:
+        st.session_state.chat_provider = preferred_provider() or "cerebras"
+    if providers and st.session_state.chat_provider not in providers:
+        st.session_state.chat_provider = providers[0]
+
+    if providers:
+        selected_provider = st.radio(
+            "Model provider",
+            options=providers,
+            format_func=lambda value: provider_labels.get(value, value.title()),
+            horizontal=True,
+            key="chat_provider",
+        )
+        if selected_provider == "cerebras":
+            st.caption("Cerebras calls are paced locally to avoid burst rate limits. The chat will show a short status update while it waits.")
+    else:
+        selected_provider = None
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "pending_question" not in st.session_state:
+        st.session_state.pending_question = None
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("sql"):
+                st.code(message["sql"], language="sql")
+            if message.get("rows") is not None:
+                render_rows(message["rows"], limit=20)
+
+    prompt = st.chat_input("Example: show microsoft bugs from last month above 8.0")
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        if not providers:
+            st.session_state.messages.append(
+                {"role": "assistant", "content": "Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use chat."}
+            )
+            st.rerun()
+
+        pending_question = st.session_state.pending_question
+        full_question = prompt if pending_question is None else apply_clarification(pending_question, prompt)
+
+        with st.chat_message("assistant"):
+            status = st.status("Thinking...", expanded=False)
+
+            def update_status(message):
+                status.update(label=message, state="running", expanded=False)
+
+            try:
+                result = resolve_query(
+                    db_path,
+                    full_question,
+                    status_callback=update_status,
+                    provider=selected_provider,
+                )
+                if result["action"] == "ask_clarification":
+                    st.session_state.pending_question = full_question
+                    status.update(label="Need one clarification", state="complete", expanded=False)
+                    st.markdown("I need one more detail to narrow this down:")
+                    st.markdown(result["clarification_question"])
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"I need one more detail to narrow this down:\n\n{result['clarification_question']}",
+                        }
+                    )
+                else:
+                    st.session_state.pending_question = None
+                    status.update(label=f"Returned {len(result['rows'])} row(s)", state="complete", expanded=False)
+                    st.markdown(f"Returned {len(result['rows'])} row(s).")
+                    st.code(result["sql"], language="sql")
+                    render_rows(result["rows"], limit=20)
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"Returned {len(result['rows'])} row(s).",
+                            "sql": result["sql"],
+                            "rows": result["rows"],
+                        }
+                    )
+            except Exception as error:
+                status.update(label="Query failed", state="error", expanded=False)
+                st.markdown(f"Query failed: {error}")
+                st.session_state.messages.append({"role": "assistant", "content": f"Query failed: {error}"})
+        st.rerun()
 
     metrics = get_metrics()
+    st.divider()
     a, b, c, d = st.columns(4)
     a.metric("AI requests", metrics["requests"])
     b.metric("Prompt tokens", metrics["prompt_tokens"])
@@ -208,55 +308,6 @@ def render_chat(db_path):
             render_rows(metrics["events"], title="Recent AI events", limit=20)
         else:
             st.info("No AI requests yet.")
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "pending_question" not in st.session_state:
-        st.session_state.pending_question = None
-
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message.get("sql"):
-                st.code(message["sql"], language="sql")
-            if message.get("rows") is not None:
-                render_rows(message["rows"], limit=20)
-
-    prompt = st.chat_input("Example: show microsoft bugs from last month above 8.0")
-    if not prompt:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": prompt})
-
-    if not api_key() and not gemini_api_key():
-        st.session_state.messages.append(
-            {"role": "assistant", "content": "Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use chat."}
-        )
-        st.rerun()
-
-    pending_question = st.session_state.pending_question
-    full_question = prompt if pending_question is None else apply_clarification(pending_question, prompt)
-
-    try:
-        result = resolve_query(db_path, full_question)
-        if result["action"] == "ask_clarification":
-            st.session_state.pending_question = full_question
-            st.session_state.messages.append(
-                {"role": "assistant", "content": result["clarification_question"]}
-            )
-        else:
-            st.session_state.pending_question = None
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"Returned {len(result['rows'])} row(s).",
-                    "sql": result["sql"],
-                    "rows": result["rows"],
-                }
-            )
-    except Exception as error:
-        st.session_state.messages.append({"role": "assistant", "content": f"Query failed: {error}"})
-    st.rerun()
 
 
 def main():

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import date, datetime
 from functools import lru_cache
 from typing import Literal
@@ -19,6 +20,14 @@ load_dotenv()
 
 ALLOWED_TABLES = {"cves", "vendors", "products", "cve_products"}
 MAX_EVENTS = 20
+PROVIDER_MIN_INTERVAL = {
+    "cerebras": 2.1,
+    "gemini": 0.3,
+}
+LAST_REQUEST_AT = {
+    "cerebras": 0.0,
+    "gemini": 0.0,
+}
 
 
 class Plan(BaseModel):
@@ -45,28 +54,19 @@ class Plan(BaseModel):
 
 PLAN_SCHEMA = Plan.model_json_schema()
 SYSTEM_PROMPT = (
-    "You are an NL-to-SQL planner for SQLite.\n"
-    "Return only JSON that matches the provided schema.\n"
+    "Plan SQLite queries for a CVE database.\n"
+    "Return JSON matching the provided schema.\n"
+    "Tables: cves(cve_id, description, published, last_modified, severity, cvss_score, source, url), "
+    "vendors(vendor_id, name), products(product_id, vendor_id, name), cve_products(cve_id, product_id).\n"
     "Rules:\n"
-    "- Use only these tables: cves, vendors, products, cve_products.\n"
-    "- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA, ATTACH, VACUUM, or other mutating SQL.\n"
-    "- Ask a clarification question only when the request is genuinely too vague to produce a useful SQL query.\n"
-    "- Do not ask a clarification question just because the user said latest, newest, most recent, or last added.\n"
-    "- If the user asks for the latest or newest bug, sort by COALESCE(c.published, c.last_modified) DESC and return the single newest relevant row unless the user explicitly asks for more.\n"
-    "- For product, project, vendor, or keyword searches, search across cves.cve_id, cves.description, vendors.name, and products.name when relevant.\n"
-    "- Use SQLite syntax only.\n"
-    "- Prefer short, useful SELECT queries with LIMIT 20 unless the user clearly wants one row or an aggregate.\n"
-    f"- Today's date is {date.today().isoformat()}.\n"
-    "Schema:\n"
-    "cves(cve_id, description, published, last_modified, severity, cvss_score, source, url)\n"
-    "vendors(vendor_id, name)\n"
-    "products(product_id, vendor_id, name)\n"
-    "cve_products(cve_id, product_id)\n"
-    "Examples in prose:\n"
-    "- 'show me the latest added openclaw bug' should search for openclaw, order newest first, and return one row.\n"
-    "- 'show me the bad ones' should ask what CVSS threshold counts as bad.\n"
-    "- 'show me Microsoft bugs from last month' should filter Microsoft-related rows and the previous calendar month.\n"
-    "- 'what is the average risk score in my database' should return an aggregate query.\n"
+    "- SELECT only.\n"
+    "- Use only cves, vendors, products, cve_products.\n"
+    "- Ask one clarification only if the request is too vague to query usefully.\n"
+    "- latest/newest/last added means order by COALESCE(c.published, c.last_modified) DESC; return one row unless the user asks for more.\n"
+    "- Search keywords across cves.cve_id, cves.description, vendors.name, and products.name when relevant.\n"
+    "- Use SQLite syntax.\n"
+    "- Use LIMIT 20 by default.\n"
+    f"- Today is {date.today().isoformat()}.\n"
 )
 AI_METRICS = {
     "requests": 0,
@@ -128,6 +128,23 @@ def apply_clarification(question, answer):
     return f"Original request: {question}\nClarification from user: {answer}"
 
 
+def preferred_provider():
+    if api_key():
+        return "cerebras"
+    if gemini_api_key():
+        return "gemini"
+    return None
+
+
+def available_providers():
+    providers = []
+    if api_key():
+        providers.append("cerebras")
+    if gemini_api_key():
+        providers.append("gemini")
+    return providers
+
+
 def log_stdout(message):
     print(f"[AI] {message}")
 
@@ -181,6 +198,12 @@ def _content_text(content):
     return str(content or "").strip()
 
 
+def _safe_len(value):
+    if value is None:
+        return 0
+    return len(str(value))
+
+
 def record_request(provider, model, usage=None, status="ok", note="", http_status=None):
     usage = usage or {}
     prompt_tokens = usage.get("prompt_tokens")
@@ -216,6 +239,27 @@ def record_request(provider, model, usage=None, status="ok", note="", http_statu
         f"completion_tokens={event['completion_tokens']} total_tokens={event['total_tokens']} "
         f"note={note or '-'}"
     )
+
+
+def throttle_provider(provider, status_callback=None):
+    minimum_interval = PROVIDER_MIN_INTERVAL.get(provider, 0)
+    if minimum_interval <= 0:
+        return
+
+    now = time.monotonic()
+    elapsed = now - LAST_REQUEST_AT.get(provider, 0.0)
+    wait_seconds = minimum_interval - elapsed
+    if wait_seconds > 0:
+        log_stdout(f"throttle provider={provider} sleep_seconds={wait_seconds:.2f}")
+        notify_status(status_callback, f"Waiting {wait_seconds:.1f}s to respect {provider} rate limits...")
+        time.sleep(wait_seconds)
+        now = time.monotonic()
+    LAST_REQUEST_AT[provider] = now
+
+
+def notify_status(status_callback, message):
+    if status_callback is not None:
+        status_callback(message)
 
 
 def get_metrics():
@@ -302,17 +346,22 @@ def _gemini_usage(response):
     }
 
 
-def generate_plan_cerebras(question, retry_message=""):
+def generate_plan_cerebras(question, retry_message="", status_callback=None):
     client = cerebras_client()
     model = model_name()
     if client is None:
         raise RuntimeError("Cerebras client is not configured.")
 
     try:
+        notify_status(status_callback, "Thinking through the request...")
+        throttle_provider("cerebras", status_callback=status_callback)
+        notify_status(status_callback, "Drafting a SQL plan...")
         completion = client.chat.completions.create(
             model=model,
+            reasoning_effort="low",
+            reasoning_format="hidden",
             temperature=0,
-            max_completion_tokens=220,
+            max_completion_tokens=384,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt(question, retry_message)},
@@ -326,11 +375,19 @@ def generate_plan_cerebras(question, retry_message=""):
                 },
             },
         )
+        choice = completion.choices[0]
+        message = choice.message
         usage = _cerebras_usage(completion)
-        content = _content_text(_read_value(completion.choices[0].message, "content"))
+        content = _content_text(_read_value(message, "content"))
+        finish_reason = _read_value(choice, "finish_reason")
+        reasoning = _read_value(message, "reasoning")
         if not content:
-            record_request("cerebras", model, usage, status="error", note="no content")
-            raise RuntimeError("Cerebras returned no structured content.")
+            note = (
+                f"no content; finish_reason={finish_reason or '-'}; "
+                f"reasoning_chars={_safe_len(reasoning)}"
+            )
+            record_request("cerebras", model, usage, status="error", note=note)
+            raise RuntimeError(f"Cerebras returned no structured content. {note}")
         record_request("cerebras", model, usage, status="ok")
         return content
     except Exception as error:
@@ -344,13 +401,16 @@ def generate_plan_cerebras(question, retry_message=""):
         raise
 
 
-def generate_plan_gemini(question, retry_message=""):
+def generate_plan_gemini(question, retry_message="", status_callback=None):
     client = gemini_client()
     model = gemini_model()
     if client is None:
         raise RuntimeError("Gemini client is not configured.")
 
     try:
+        notify_status(status_callback, "Thinking through the request...")
+        throttle_provider("gemini", status_callback=status_callback)
+        notify_status(status_callback, "Drafting a SQL plan...")
         response = client.models.generate_content(
             model=model,
             contents=user_prompt(question, retry_message),
@@ -380,35 +440,45 @@ def generate_plan_gemini(question, retry_message=""):
         raise
 
 
-def generate_plan(question, retry_message=""):
-    if api_key():
-        return generate_plan_cerebras(question, retry_message)
-    if gemini_api_key():
-        return generate_plan_gemini(question, retry_message)
+def generate_plan(question, retry_message="", status_callback=None, provider=None):
+    selected_provider = provider or preferred_provider()
+    if selected_provider == "cerebras":
+        if not api_key():
+            raise RuntimeError("CEREBRAS_API_KEY is not set.")
+        return generate_plan_cerebras(question, retry_message, status_callback=status_callback)
+    if selected_provider == "gemini":
+        if not gemini_api_key():
+            raise RuntimeError("GEMINI_API_KEY is not set.")
+        return generate_plan_gemini(question, retry_message, status_callback=status_callback)
     raise RuntimeError("Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use AI query.")
 
 
-def resolve_query(db_path, question, max_attempts=1):
+def resolve_query(db_path, question, max_attempts=1, status_callback=None, provider=None):
     retry_message = ""
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
         log_stdout(f"resolve attempt={attempt}/{max_attempts} question={question!r}")
-        raw = generate_plan(question, retry_message)
+        raw = generate_plan(question, retry_message, status_callback=status_callback, provider=provider)
         try:
             plan = parse_plan(raw)
             if plan["action"] == "ask_clarification":
+                notify_status(status_callback, "I need one detail before I run the query...")
                 log_stdout(f"planner requested clarification question={plan['clarification_question']!r}")
                 return plan
 
+            notify_status(status_callback, "Validating the SQL against the database...")
             sql = validate_sql(plan["sql"])
             validate_sql_with_sqlite(db_path, sql)
+            notify_status(status_callback, "Running the query...")
             rows = fetch_all(db_path, sql)
+            notify_status(status_callback, "Query complete. Preparing the results...")
             log_stdout(f"sql accepted rows={len(rows)}")
             return {"action": "run_sql", "sql": sql, "rows": rows}
         except Exception as error:
             last_error = error
             retry_message = str(error)
+            notify_status(status_callback, f"That query plan did not validate: {retry_message}")
             log_stdout(f"attempt failed reason={retry_message}")
 
     raise RuntimeError(f"Could not produce a valid AI query. Last error: {last_error}")
