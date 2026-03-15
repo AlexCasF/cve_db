@@ -59,6 +59,14 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
+## Live Demo
+
+The Streamlit app is also deployed here:
+
+- https://cve-db.streamlit.app/
+
+It runs on Streamlit Community Cloud's free tier and is already configured with the required API keys as app secrets, so it is ready to use without local setup.
+
 ## Environment Variables
 
 Create a `.env` file in the project root. You can copy from `.env.example`.
