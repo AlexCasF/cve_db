@@ -67,7 +67,7 @@ Create a `.env` file in the project root. You can copy from `.env.example`.
 CVE_DB_PATH=cve.db
 NIST_API_KEY=your_nist_key_here
 CEREBRAS_API_KEY=your_cerebras_key_here
-CEREBRAS_MODEL=gpt-oss-120b
+CEREBRAS_MODEL=qwen-3-235b-a22b-instruct-2507
 GEMINI_API_KEY=your_gemini_key_here
 GEMINI_MODEL=gemini-2.5-flash
 ```
@@ -77,6 +77,7 @@ Notes:
 - `CVE_DB_PATH` is optional. If omitted, the app uses `cve.db`.
 - `NIST_API_KEY` is optional but recommended for NVD sync.
 - `CEREBRAS_API_KEY` and `GEMINI_API_KEY` are optional unless you want AI query/chat.
+- `CEREBRAS_MODEL` defaults to `qwen-3-235b-a22b-instruct-2507`.
 - AI query works with either provider. Cerebras is preferred if configured.
 
 ## Run The CLI

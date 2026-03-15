@@ -98,7 +98,7 @@ AI_METRICS = {
 
 def model_name():
     load_dotenv()
-    return os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+    return os.getenv("CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507")
 
 
 def api_key():
