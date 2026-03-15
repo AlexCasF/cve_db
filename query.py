@@ -203,6 +203,20 @@ def _error_note(error):
     return " | ".join(parts)
 
 
+def _error_message(error):
+    message = _read_value(error, "message")
+    if message:
+        return str(message)
+
+    body = _read_value(error, "body")
+    if isinstance(body, dict):
+        detail = body.get("message") or body.get("error") or body.get("details")
+        if detail:
+            return str(detail)
+
+    return str(error)
+
+
 def _content_text(content):
     if isinstance(content, str):
         return content
@@ -390,6 +404,13 @@ def _gemini_usage(response):
     }
 
 
+def _is_unsupported_reasoning_error(error):
+    if _error_status(error) != 422:
+        return False
+    message = _error_message(error).lower()
+    return "reasoning effort is not supported" in message
+
+
 def generate_plan_cerebras(question, retry_message="", status_callback=None):
     client = cerebras_client()
     model = model_name()
@@ -400,17 +421,15 @@ def generate_plan_cerebras(question, retry_message="", status_callback=None):
         notify_status(status_callback, "Thinking through the request...")
         throttle_provider("cerebras", status_callback=status_callback)
         notify_status(status_callback, "Drafting a SQL plan...")
-        completion = client.chat.completions.create(
-            model=model,
-            reasoning_effort="low",
-            reasoning_format="hidden",
-            temperature=0,
-            max_completion_tokens=384,
-            messages=[
+        request_kwargs = {
+            "model": model,
+            "temperature": 0,
+            "max_completion_tokens": 384,
+            "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt(question, retry_message)},
             ],
-            response_format={
+            "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "nl_sql_plan",
@@ -418,7 +437,19 @@ def generate_plan_cerebras(question, retry_message="", status_callback=None):
                     "schema": PLAN_SCHEMA,
                 },
             },
-        )
+        }
+        try:
+            completion = client.chat.completions.create(
+                reasoning_effort="low",
+                reasoning_format="hidden",
+                **request_kwargs,
+            )
+        except Exception as error:
+            if not _is_unsupported_reasoning_error(error):
+                raise
+            log_stdout(f"retry provider=cerebras model={model} without_reasoning_params=true")
+            notify_status(status_callback, "Retrying without model-specific reasoning settings...")
+            completion = client.chat.completions.create(**request_kwargs)
         choice = completion.choices[0]
         message = choice.message
         usage = _cerebras_usage(completion)
@@ -461,7 +492,7 @@ def generate_plan_gemini(question, retry_message="", status_callback=None):
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
-                max_output_tokens=320,
+                max_output_tokens=512,
                 response_mime_type="application/json",
                 response_json_schema=sanitize_json_schema(PLAN_SCHEMA),
             ),
@@ -510,7 +541,7 @@ def generate_plan(question, retry_message="", status_callback=None, provider=Non
     raise RuntimeError("Set CEREBRAS_API_KEY or GEMINI_API_KEY in .env to use AI query.")
 
 
-def resolve_query(db_path, question, max_attempts=1, status_callback=None, provider=None):
+def resolve_query(db_path, question, max_attempts=3, status_callback=None, provider=None):
     retry_message = ""
     last_error = None
 

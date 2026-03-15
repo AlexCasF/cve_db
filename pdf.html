@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cybersteps CVE DB - Project Summary</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 18mm;
+    }
+
+    :root {
+      --ink: #18222f;
+      --muted: #516072;
+      --line: #d7dde5;
+      --panel: #f6f8fb;
+      --accent: #0f5f87;
+      --accent-soft: #e8f3f8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--ink);
+      background: white;
+      line-height: 1.55;
+      font-size: 12pt;
+    }
+
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+    }
+
+    header {
+      border-bottom: 3px solid var(--accent);
+      padding-bottom: 14px;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 26pt;
+      line-height: 1.1;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12pt;
+    }
+
+    section {
+      margin: 0 0 18px;
+      page-break-inside: avoid;
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 15pt;
+      color: var(--accent);
+    }
+
+    p {
+      margin: 0 0 10px;
+    }
+
+    ul, ol {
+      margin: 8px 0 10px 22px;
+    }
+
+    li {
+      margin: 4px 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px 14px;
+    }
+
+    .callout {
+      background: var(--accent-soft);
+      border-left: 5px solid var(--accent);
+      padding: 12px 14px;
+      border-radius: 8px;
+    }
+
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.95em;
+    }
+
+    pre {
+      margin: 10px 0 0;
+      padding: 12px 14px;
+      background: #101820;
+      color: #f3f6fb;
+      border-radius: 10px;
+      overflow-x: auto;
+      font-size: 10.5pt;
+      line-height: 1.45;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 10.5pt;
+    }
+
+    @media print {
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Cybersteps CVE DB</h1>
+      <p class="subtitle">Project Summary for Submission Item 4: quick run guide, design choices, and a real bug fix from development.</p>
+    </header>
+
+    <section>
+      <h2>Project Overview</h2>
+      <p>
+        This project is a small CVE database system built with Python and SQLite. It supports manual entry,
+        bulk import from CSV and JSON, live syncing from the National Vulnerability Database, SQL-based analysis,
+        and an AI feature that turns natural-language questions into safe SQL queries.
+      </p>
+    </section>
+
+    <section>
+      <h2>Quick Guide: How To Run The Tool</h2>
+      <div class="panel">
+        <ol>
+          <li>Open a terminal in the project folder.</li>
+          <li>Create a virtual environment: <code>python -m venv venv</code></li>
+          <li>Activate it on Windows: <code>.\venv\Scripts\activate</code></li>
+          <li>Install packages: <code>pip install -r requirements.txt</code></li>
+          <li>Create a <code>.env</code> file if you want NVD sync or AI features.</li>
+          <li>Run the CLI: <code>python main.py</code></li>
+          <li>Optional: run the web UI: <code>streamlit run ui.py</code></li>
+        </ol>
+        <pre>CVE_DB_PATH=cve.db
+NIST_API_KEY=your_nist_key_here
+CEREBRAS_API_KEY=your_cerebras_key_here
+GEMINI_API_KEY=your_gemini_key_here</pre>
+      </div>
+    </section>
+
+    <section>
+      <h2>Why I Chose This Structure</h2>
+      <div class="grid">
+        <div class="panel">
+          <p><strong>Relational schema</strong></p>
+          <p>
+            I used four tables: <code>cves</code>, <code>vendors</code>, <code>products</code>, and
+            <code>cve_products</code>. That keeps the main vulnerability record separate from the affected
+            software relationships and makes SQL analysis much easier.
+          </p>
+        </div>
+        <div class="panel">
+          <p><strong>Separated Python modules</strong></p>
+          <p>
+            I split the program into focused files instead of putting everything in one script. For example,
+            database helpers live in <code>db.py</code>, imports in <code>imports.py</code>, sync in
+            <code>sync.py</code>, and AI logic in <code>query.py</code>.
+          </p>
+        </div>
+      </div>
+      <p>
+        This structure makes the project easier to explain, test, and extend. It also mirrors how real projects
+        are usually organized: shared infrastructure in one place and user-facing features in separate modules.
+      </p>
+    </section>
+
+    <section>
+      <h2>The Most Annoying Bug I Had To Fix</h2>
+      <p>
+        The trickiest bug happened in the AI query feature. One Cerebras model rejected the
+        <code>reasoning_effort</code> parameter with an HTTP 422 error, while Gemini sometimes returned truncated
+        JSON that failed validation before the SQL could run.
+      </p>
+      <p>
+        The fix was to make the AI planner more defensive:
+      </p>
+      <ul>
+        <li>retry Cerebras requests without model-specific reasoning parameters if the model does not support them</li>
+        <li>increase Gemini output length</li>
+        <li>allow multiple planning attempts when the JSON or SQL does not validate on the first try</li>
+      </ul>
+      <p>
+        That bug taught me an important lesson: AI features are not just about prompting. You also need validation,
+        retries, and safe fallbacks so the whole tool stays reliable.
+      </p>
+    </section>
+
+    <section>
+      <h2>Coolest Thing I Learned</h2>
+      <p>
+        The most interesting part of the project was connecting natural language to a real SQL database safely.
+        It was not enough to generate SQL. I had to restrict the model to known tables, block unsafe statements,
+        validate the query with SQLite, and sometimes ask the user a clarification question before running anything.
+      </p>
+      <p>
+        That made the feature feel much more practical and realistic than a simple chatbot answer.
+      </p>
+    </section>
+
+  </main>
+</body>
+</html>
