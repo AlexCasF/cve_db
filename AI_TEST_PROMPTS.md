@@ -72,7 +72,24 @@ These are intentionally more complex and may result in longer SQL with joins, gr
 29. `show the newest 15 vulnerabilities affecting products from vendors with more than 50 CVEs`
 30. `which vendor has the biggest gap between total CVEs and critical CVEs`
 
-## Block 6: Bonus Multi-Turn Clarification Tests
+## Block 6: Bonus Prompts That Should Trigger Clarification
+
+These are useful for checking whether the planner asks a follow-up question instead of guessing.
+
+- `show me the latest office issues`
+- `find recent exchange bugs`
+- `show edge vulnerabilities`
+- `show teams issues`
+- `find apache bugs`
+- `show linux issues`
+- `what are the worst adobe bugs`
+- `show me the important microsoft bugs`
+- `which company is the most vulnerable`
+- `show current oracle issues`
+- `find newly discovered chrome bugs`
+- `what should I patch first`
+
+## Block 7: Bonus Multi-Turn Clarification Tests
 
 These are useful for testing the multi-turn flow in `run_query()` or the Streamlit chat. These are bonus prompts beyond the 30 core examples above.
 
@@ -124,4 +141,5 @@ If you want a practical sequence instead of random testing:
 2. Move to prompts 7 to 12
 3. Try prompts 19 to 24
 4. Finish with prompts 25 to 30 for the hardest SQL generation
-5. Then run the bonus multi-turn clarification tests
+5. Then run the bonus prompts that should trigger clarification
+6. Finish with the bonus multi-turn clarification tests

@@ -186,6 +186,10 @@ GEMINI_API_KEY=your_gemini_key_here</pre>
             <code>cve_products</code>. That keeps the main vulnerability record separate from the affected
             software relationships and makes SQL analysis much easier.
           </p>
+          <p>
+            I chose this schema because it stays simple enough for the assignment while still supporting realistic
+            joins, vendor/product analysis, and many-to-many relationships between CVEs and affected software.
+          </p>
         </div>
         <div class="panel">
           <p><strong>Separated Python modules</strong></p>
@@ -229,6 +233,12 @@ GEMINI_API_KEY=your_gemini_key_here</pre>
         The most interesting part of the project was connecting natural language to a real SQL database safely.
         It was not enough to generate SQL. I had to restrict the model to known tables, block unsafe statements,
         validate the query with SQLite, and sometimes ask the user a clarification question before running anything.
+      </p>
+      <p>
+        One of the last improvements was prompt-engineering the planner so it asks better follow-up questions when
+        a request is materially ambiguous. For example, instead of guessing what words like <code>recent</code>,
+        <code>office</code>, or <code>most vulnerable</code> mean, I adjusted the system prompt so the model asks
+        for a time range, a target product, or a ranking metric first.
       </p>
       <p>
         That made the feature feel much more practical and realistic than a simple chatbot answer.

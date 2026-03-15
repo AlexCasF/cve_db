@@ -196,7 +196,6 @@ def render_analytics(db_path):
 
 def render_chat(db_path):
     st.subheader("NL to SQL chat")
-    st.caption("Chat idea: keep SQL visible, let the user refine filters, and show the result table below each reply.")
     providers = available_providers()
     provider_labels = {"cerebras": "Cerebras", "gemini": "Google"}
 
@@ -222,6 +221,11 @@ def render_chat(db_path):
         st.session_state.messages = []
     if "pending_question" not in st.session_state:
         st.session_state.pending_question = None
+
+    if st.button("Clear chat"):
+        st.session_state.messages = []
+        st.session_state.pending_question = None
+        st.rerun()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
