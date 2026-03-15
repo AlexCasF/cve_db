@@ -85,6 +85,11 @@ SYSTEM_PROMPT = f"""
 Return only JSON matching the provided schema. No markdown, no prose, no code fences. Keep the JSON minified and the SQL on one line.
 Today is {date.today().isoformat()}.
 
+Output format:
+- Clarification: {{"action":"ask_clarification","clarification_question":"...","sql":null}}
+- SQL plan: {{"action":"run_sql","clarification_question":null,"sql":"SELECT ..."}}
+- Never return query results, row arrays, explanations, or any keys other than action, clarification_question, and sql.
+
 Allowed tables:
 - cves, vendors, products, cve_products
 - cve_tags, cve_descriptions, cve_metrics, cve_weaknesses, cve_weakness_descriptions, cve_references, cve_reference_tags
@@ -171,6 +176,11 @@ def gemini_api_key():
     return os.getenv("GEMINI_API_KEY", "")
 
 
+def cerebras_fallback_model():
+    load_dotenv()
+    return os.getenv("CEREBRAS_FALLBACK_MODEL", "llama3.1-8b")
+
+
 @lru_cache(maxsize=1)
 def cerebras_client():
     key = api_key()
@@ -235,6 +245,16 @@ def _read_value(obj, *names):
 
 def _error_status(error):
     return _read_value(error, "status_code", "status")
+
+
+def _is_model_not_found(error):
+    if _error_status(error) == 404:
+        return True
+    body = _read_value(error, "body")
+    if isinstance(body, dict) and body.get("code") == "model_not_found":
+        return True
+    message = str(error).lower()
+    return "model_not_found" in message or "does not exist or you do not have access" in message
 
 
 def _error_note(error):
@@ -429,6 +449,27 @@ def validate_sql(sql):
                 raise ValueError(
                     f"{table} does not have {wrong_column}; use {correct_column} instead."
                 )
+
+    if re.search(r"(?<!\.)\bvendor\b", cleaned, re.IGNORECASE) and "nvd_cpes" not in alias_map.values():
+        raise ValueError("Use vendors.name or nvd_cpes.vendor instead of a bare vendor column.")
+    if re.search(r"(?<!\.)\bproduct\b", cleaned, re.IGNORECASE) and "nvd_cpes" not in alias_map.values():
+        raise ValueError("Use products.name or nvd_cpes.product instead of a bare product column.")
+
+    cve_alias_columns = {
+        "cve_id",
+        "description",
+        "published",
+        "last_modified",
+        "severity",
+        "cvss_score",
+        "source_identifier",
+        "source",
+        "url",
+    }
+    for column in cve_alias_columns:
+        if re.search(rf"\bc\.{column}\b", cleaned, re.IGNORECASE):
+            if alias_map.get("c") != "cves":
+                raise ValueError("If you use alias c for published/description/CVE fields, define it as FROM cves c.")
     if not re.search(r"\blimit\b", cleaned, re.IGNORECASE):
         cleaned = f"{cleaned} LIMIT 20"
     return cleaned
@@ -501,6 +542,9 @@ def user_prompt(question, retry_message=""):
     return (
         f"{retry_block}"
         "Return minified JSON only. No markdown. No explanations. SQL must be one line.\n"
+        "Return only a plan object, never query results.\n"
+        "Exact shapes: {\"action\":\"run_sql\",\"clarification_question\":null,\"sql\":\"SELECT ...\"} or "
+        "{\"action\":\"ask_clarification\",\"clarification_question\":\"...\",\"sql\":null}.\n"
         f"User request:\n{question}"
     )
 
@@ -525,57 +569,82 @@ def _gemini_usage(response):
 
 def generate_plan_cerebras(question, retry_message="", status_callback=None):
     client = cerebras_client()
-    model = model_name()
     if client is None:
         raise RuntimeError("Cerebras client is not configured.")
+    models_to_try = [model_name()]
+    fallback_model = cerebras_fallback_model()
+    if fallback_model and fallback_model not in models_to_try:
+        models_to_try.append(fallback_model)
 
-    try:
-        notify_status(status_callback, "Thinking through the request...")
-        throttle_provider("cerebras", status_callback=status_callback)
-        notify_status(status_callback, "Drafting a SQL plan...")
-        completion = client.chat.completions.create(
-            model=model,
-            reasoning_effort="low",
-            reasoning_format="hidden",
-            temperature=0,
-            max_completion_tokens=512,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt(question, retry_message)},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "nl_sql_plan",
-                    "strict": True,
-                    "schema": PLAN_SCHEMA,
+    last_error = None
+    for index, model in enumerate(models_to_try):
+        try:
+            notify_status(status_callback, "Thinking through the request...")
+            throttle_provider("cerebras", status_callback=status_callback)
+            notify_status(status_callback, "Drafting a SQL plan...")
+            request_kwargs = {
+                "model": model,
+                "temperature": 0,
+                "max_completion_tokens": 512,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt(question, retry_message)},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "nl_sql_plan",
+                        "strict": True,
+                        "schema": PLAN_SCHEMA,
+                    },
                 },
-            },
-        )
-        choice = completion.choices[0]
-        message = choice.message
-        usage = _cerebras_usage(completion)
-        content = _content_text(_read_value(message, "content"))
-        finish_reason = _read_value(choice, "finish_reason")
-        reasoning = _read_value(message, "reasoning")
-        if not content:
-            note = (
-                f"no content; finish_reason={finish_reason or '-'}; "
-                f"reasoning_chars={_safe_len(reasoning)}"
+            }
+            try:
+                completion = client.chat.completions.create(
+                    reasoning_effort="low",
+                    reasoning_format="hidden",
+                    **request_kwargs,
+                )
+            except Exception as error:
+                if "reasoning effort is not supported" in str(error).lower() or "reasoning_format" in str(error).lower():
+                    notify_status(status_callback, f"{model} does not support reasoning controls. Retrying without them...")
+                    log_stdout(f"fallback model=cerebras:{model} reason=unsupported_reasoning_controls")
+                    completion = client.chat.completions.create(
+                        **request_kwargs,
+                    )
+                else:
+                    raise
+            choice = completion.choices[0]
+            message = choice.message
+            usage = _cerebras_usage(completion)
+            content = _content_text(_read_value(message, "content"))
+            finish_reason = _read_value(choice, "finish_reason")
+            reasoning = _read_value(message, "reasoning")
+            if not content:
+                note = (
+                    f"no content; finish_reason={finish_reason or '-'}; "
+                    f"reasoning_chars={_safe_len(reasoning)}"
+                )
+                record_request("cerebras", model, usage, status="error", note=note)
+                raise RuntimeError(f"Cerebras returned no structured content. {note}")
+            record_request("cerebras", model, usage, status="ok")
+            return content
+        except Exception as error:
+            last_error = error
+            record_request(
+                "cerebras",
+                model,
+                status="error",
+                note=_error_note(error),
+                http_status=_error_status(error),
             )
-            record_request("cerebras", model, usage, status="error", note=note)
-            raise RuntimeError(f"Cerebras returned no structured content. {note}")
-        record_request("cerebras", model, usage, status="ok")
-        return content
-    except Exception as error:
-        record_request(
-            "cerebras",
-            model,
-            status="error",
-            note=_error_note(error),
-            http_status=_error_status(error),
-        )
-        raise
+            if _is_model_not_found(error) and index + 1 < len(models_to_try):
+                next_model = models_to_try[index + 1]
+                notify_status(status_callback, f"{model} is unavailable for this key. Falling back to {next_model}...")
+                log_stdout(f"fallback model=cerebras:{model}->{next_model} reason=model_not_found")
+                continue
+            raise
+    raise last_error or RuntimeError("Cerebras planning failed.")
 
 
 def generate_plan_gemini(question, retry_message="", status_callback=None):
@@ -594,19 +663,12 @@ def generate_plan_gemini(question, retry_message="", status_callback=None):
             config=genai_types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0,
-                max_output_tokens=320,
+                max_output_tokens=512,
                 response_mime_type="application/json",
-                response_json_schema=sanitize_json_schema(PLAN_SCHEMA),
             ),
         )
         usage = _gemini_usage(response)
-        parsed = _read_value(response, "parsed")
-        if isinstance(parsed, Plan):
-            text = parsed.model_dump_json()
-        elif isinstance(parsed, dict):
-            text = json.dumps(parsed)
-        else:
-            text = _content_text(_read_value(response, "text"))
+        text = extract_json(_content_text(_read_value(response, "text")))
         if not text:
             record_request("gemini", model, usage, status="error", note="no text")
             raise RuntimeError("Gemini returned no structured text.")
@@ -634,6 +696,10 @@ def generate_plan(question, retry_message="", status_callback=None, provider=Non
             if _error_status(error) == 429 and gemini_api_key():
                 notify_status(status_callback, "Cerebras is busy right now. Falling back to Google...")
                 log_stdout("fallback provider=cerebras->gemini reason=429")
+                return generate_plan_gemini(question, retry_message, status_callback=status_callback)
+            if _is_model_not_found(error) and gemini_api_key():
+                notify_status(status_callback, "This Cerebras model is unavailable for your key. Falling back to Google...")
+                log_stdout("fallback provider=cerebras->gemini reason=model_not_found")
                 return generate_plan_gemini(question, retry_message, status_callback=status_callback)
             raise
     if selected_provider == "gemini":
