@@ -3,7 +3,7 @@ import os
 from db import init_db
 from entry import run as run_entry
 from imports import run as run_imports
-from query import run as run_query
+from query import run as run_query, run_sql_console
 from sync import run as run_sync
 from dotenv import load_dotenv
 
@@ -20,6 +20,7 @@ def main():
         print("2. Import and analysis")
         print("3. NVD sync")
         print("4. AI query")
+        print("5. Manual SQL")
         print("0. Exit")
         choice = input("Choose: ").strip()
 
@@ -31,6 +32,8 @@ def main():
             run_sync(db_path)
         elif choice == "4":
             run_query(db_path)
+        elif choice == "5":
+            run_sql_console(db_path)
         elif choice == "0":
             return
         else:

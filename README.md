@@ -10,6 +10,7 @@ Cybersteps CVE DB is a Python + SQLite project for storing, exploring, syncing, 
 - Analyze the dataset with stats and filters
 - Sync recently updated CVEs from the NVD API
 - Ask questions in plain English and have AI generate safe SQL
+- Run manual read-only SQL queries in both the CLI and the web UI
 - Browse the same database through an optional Streamlit UI
 
 ## Tech Stack
@@ -30,7 +31,7 @@ Cybersteps CVE DB is a Python + SQLite project for storing, exploring, syncing, 
 - `imports.py` - CSV/JSON import, NVD JSON parsing, stats, and filtering
 - `sync.py` - live NVD sync using `requests`
 - `query.py` - AI planning, SQL validation, clarification loop, metering
-- `ui.py` - optional Streamlit frontend
+- `ui.py` - optional Streamlit frontend with chat and manual SQL
 - `schema.sql` - relational schema and indexes
 - `cve.db` - SQLite database file used by default
 
@@ -100,6 +101,7 @@ CLI menu:
 2. Import and analysis
 3. NVD sync
 4. AI query
+5. Manual SQL
 0. Exit
 
 ## Run The Streamlit UI
@@ -114,6 +116,7 @@ The UI has four tabs:
 - Data
 - Analytics
 - Chat
+- SQL
 
 ## How Each Part Works
 
@@ -188,6 +191,27 @@ The AI layer also includes:
 - retry support for invalid query plans
 - request/token metrics
 - a fallback path for Cerebras model compatibility issues
+
+## 5. Manual SQL
+
+Both the CLI and the Streamlit UI now support manual read-only SQL queries.
+
+This is useful when:
+
+- you already know the SQL you want to run
+- you want more control than the AI planner provides
+- you want to inspect the database directly from the app
+
+Safety rules:
+
+- only read-only `SELECT` queries are allowed
+- read-only `WITH ... SELECT ...` queries are also supported
+- destructive SQL is blocked
+- queries are restricted to the known CVE tables
+
+In the CLI, choose `Manual SQL`, enter your query, and finish with `END` on its own line.
+
+In the GUI, open the `SQL` tab, paste a query, and click `Run SQL`.
 
 ## Quick Demo Checklist
 

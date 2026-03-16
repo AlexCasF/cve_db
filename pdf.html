@@ -139,7 +139,8 @@
       <p>
         This project is a small CVE database system built with Python and SQLite. It supports manual entry,
         bulk import from CSV and JSON, live syncing from the National Vulnerability Database, SQL-based analysis,
-        and an AI feature that turns natural-language questions into safe SQL queries.
+        an AI feature that turns natural-language questions into safe SQL queries, and a manual read-only SQL view
+        in both the CLI and GUI.
       </p>
     </section>
 
@@ -203,6 +204,10 @@ GEMINI_API_KEY=your_gemini_key_here</pre>
       <p>
         This structure makes the project easier to explain, test, and extend. It also mirrors how real projects
         are usually organized: shared infrastructure in one place and user-facing features in separate modules.
+      </p>
+      <p>
+        I also added a manual SQL feature on top of the same shared validation logic, so both the CLI and GUI can
+        run direct read-only database queries without opening SQLite separately.
       </p>
     </section>
 

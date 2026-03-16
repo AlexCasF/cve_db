@@ -363,7 +363,7 @@ def extract_sql(text):
     match = re.search(r"```(?:sql)?\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
     if match:
         text = match.group(1)
-    match = re.search(r"\bselect\b.*", text, re.IGNORECASE | re.DOTALL)
+    match = re.search(r"\b(select|with)\b.*", text, re.IGNORECASE | re.DOTALL)
     if match:
         text = match.group(0)
     return text.strip().rstrip(";")
@@ -371,12 +371,19 @@ def extract_sql(text):
 
 def validate_sql(sql):
     cleaned = extract_sql(sql)
-    if not cleaned.lower().startswith("select"):
-        raise ValueError("Only SELECT queries are allowed.")
+    lowered = cleaned.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        raise ValueError("Only read-only SELECT queries are allowed.")
     if re.search(r"\b(insert|update|delete|drop|alter|create|pragma|attach|vacuum|replace|truncate)\b", cleaned, re.IGNORECASE):
         raise ValueError("Unsafe SQL blocked.")
+    cte_names = {
+        name.lower()
+        for name in re.findall(r"\bwith\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+as\b|\),\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+as\b", cleaned, re.IGNORECASE)
+        for name in name
+        if name
+    }
     for table in re.findall(r"\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)", cleaned, re.IGNORECASE):
-        if table.lower() not in ALLOWED_TABLES:
+        if table.lower() not in ALLOWED_TABLES and table.lower() not in cte_names:
             raise ValueError(f"Table not allowed: {table}")
     if not re.search(r"\blimit\b", cleaned, re.IGNORECASE):
         cleaned = f"{cleaned} LIMIT 20"
@@ -600,6 +607,40 @@ def run_query_with_text(db_path, question):
     if result["action"] != "run_sql":
         raise RuntimeError(result["clarification_question"])
     return result["sql"], result["rows"]
+
+
+def run_manual_sql(db_path, sql):
+    validated = validate_sql(sql)
+    validate_sql_with_sqlite(db_path, validated)
+    rows = fetch_all(db_path, validated)
+    return validated, rows
+
+
+def run_sql_console(db_path):
+    print("\nManual SQL")
+    print("Enter a read-only SELECT query. Type END on its own line to run it.")
+    lines = []
+    while True:
+        line = input()
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    sql = "\n".join(lines).strip()
+    if not sql:
+        print("SQL is required.")
+        return
+
+    try:
+        validated, rows = run_manual_sql(db_path, sql)
+    except Exception as error:
+        print(f"Manual SQL failed: {error}")
+        return
+
+    print("\nExecuted SQL")
+    print(validated)
+    print("\nResults")
+    print_rows(rows, limit=20)
 
 
 def run(db_path):

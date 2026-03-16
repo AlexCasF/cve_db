@@ -15,6 +15,7 @@ from query import (
     preferred_provider,
     reset_metrics,
     resolve_query,
+    run_manual_sql,
 )
 from sync import sync_recent
 
@@ -314,6 +315,27 @@ def render_chat(db_path):
             st.info("No AI requests yet.")
 
 
+def render_sql(db_path):
+    st.subheader("Manual SQL")
+    st.caption("Run read-only SQL against the local CVE database. Only SELECT and WITH ... SELECT queries are allowed.")
+    sql = st.text_area(
+        "SQL query",
+        height=180,
+        placeholder="SELECT cve_id, severity, cvss_score FROM cves ORDER BY published DESC LIMIT 20",
+    )
+    if st.button("Run SQL"):
+        if not sql.strip():
+            st.error("SQL is required.")
+            return
+        try:
+            validated, rows = run_manual_sql(db_path, sql)
+            st.caption("Executed SQL")
+            st.code(validated, language="sql")
+            render_rows(rows, title=f"Returned {len(rows)} row(s)", limit=50)
+        except Exception as error:
+            st.error(f"Manual SQL failed: {error}")
+
+
 def main():
     load_dotenv()
     st.set_page_config(page_title="Cybersteps CVE DB", layout="wide")
@@ -323,7 +345,7 @@ def main():
     db_path = st.sidebar.text_input("Database path", value=os.getenv("CVE_DB_PATH", "cve.db"))
     init_db(db_path)
 
-    search_tab, data_tab, analytics_tab, chat_tab = st.tabs(["Search", "Data", "Analytics", "Chat"])
+    search_tab, data_tab, analytics_tab, chat_tab, sql_tab = st.tabs(["Search", "Data", "Analytics", "Chat", "SQL"])
     with search_tab:
         render_search(db_path)
     with data_tab:
@@ -332,6 +354,8 @@ def main():
         render_analytics(db_path)
     with chat_tab:
         render_chat(db_path)
+    with sql_tab:
+        render_sql(db_path)
 
 
 if __name__ == "__main__":
